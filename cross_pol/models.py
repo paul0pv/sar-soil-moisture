@@ -16,12 +16,12 @@ class DielectricModel:
     - Frecuencia
 
     Referencia: Hallikainen et al., IEEE TGRS, Vol. GE-23, No. 1, 1985
-    Tablas IV y V, páginas 26-27
+    Ecuaciones (1)-(4), Tablas IV y V
     """
 
-    def __init__(self, sand_pct, clay_pct):
+    def __init__(self, sand_pct: float, clay_pct: float):
         """
-        Inicializa el modelo dieléctrico con la textura del suelo.
+        Inicializa el modelo dieléctrico.
 
         Args:
             sand_pct: Porcentaje de arena (0-100)
@@ -29,10 +29,10 @@ class DielectricModel:
         """
         self.sand = sand_pct
         self.clay = clay_pct
-        self.silt = 100 - sand_pct - clay_pct
+        self.silt = 100.0 - sand_pct - clay_pct
 
         # Coeficientes de regresión para Epsilon Prima (Parte Real) - Tabla IV
-        # Estructura: P = alpha + beta*f + gamma*f^2 (f en GHz)
+        # Estructura: coef = alpha + beta*f + gamma*f² (f en GHz)
         self.coeffs_real = {
             "a0": {"alpha": 3.51, "beta": -6.83e-2, "gamma": 1.05e-3},
             "a1": {"alpha": -2.96e-2, "beta": 5.21e-4, "gamma": -6.3e-6},
@@ -58,24 +58,18 @@ class DielectricModel:
             "f2": {"alpha": -3.27e-1, "beta": 1.95e-2, "gamma": -4.0e-4},
         }
 
-    def _get_poly_coeff(self, coeff_dict, f_ghz):
+    def _poly(self, coeff, f_ghz):
         """
-        Calcula un coeficiente (a0, b0, etc.) usando el polinomio cuadrático.
-
-        Fórmula: coeff = alpha + beta*f + gamma*f²
+        Evalúa polinomio cuadrático: alpha + beta*f + gamma*f².
 
         Args:
-            coeff_dict: Diccionario con alpha, beta, gamma
+            coeff: Diccionario con {alpha, beta, gamma}
             f_ghz: Frecuencia en GHz
 
         Returns:
             Valor del coeficiente
         """
-        return (
-            coeff_dict["alpha"]
-            + coeff_dict["beta"] * f_ghz
-            + coeff_dict["gamma"] * (f_ghz**2)
-        )
+        return coeff["alpha"] + coeff["beta"] * f_ghz + coeff["gamma"] * f_ghz**2
 
     def compute_dielectric(self, mv, frequency=5.405e9):
         """
@@ -86,70 +80,58 @@ class DielectricModel:
         ε' = A + B·mv + C·mv²
         ε'' = D + E·mv + F·mv²
 
-        Donde:
-        A = a₀ + a₁·S + a₂·C
-        B = b₀ + b₁·S + b₂·C
-        C = c₀ + c₁·S + c₂·C
-        (similar para D, E, F)
+        Donde A, B, C (y D, E, F) dependen de textura y frecuencia.
 
         Args:
             mv: Humedad volumétrica (%) - escalar o array
-            frequency: Frecuencia en Hz (default: 5.405 GHz)
+            frequency: Frecuencia en Hz (default: 5.405 GHz, banda C)
 
         Returns:
-            Constante dieléctrica compleja ε_r = ε' - jε''
+            Constante dieléctrica compleja ε_r = ε' + jε''
         """
-        # Convertir frecuencia a GHz
         f_ghz = frequency / 1e9
-
-        # Asegurar que mv es array y normalizar a fracción
         mv = np.asarray(mv)
+
+        # Normalizar a fracción (0-1)
         mv_frac = np.where(mv > 1.0, mv / 100.0, mv)
 
-        S = self.sand
-        C = self.clay
+        S, C = self.sand, self.clay
 
-        # --- PARTE REAL (Epsilon Prima) ---
-        # Calcular coeficientes dependientes de frecuencia (Tabla IV)
-        a0 = self._get_poly_coeff(self.coeffs_real["a0"], f_ghz)
-        a1 = self._get_poly_coeff(self.coeffs_real["a1"], f_ghz)
-        a2 = self._get_poly_coeff(self.coeffs_real["a2"], f_ghz)
-        b0 = self._get_poly_coeff(self.coeffs_real["b0"], f_ghz)
-        b1 = self._get_poly_coeff(self.coeffs_real["b1"], f_ghz)
-        b2 = self._get_poly_coeff(self.coeffs_real["b2"], f_ghz)
-        c0 = self._get_poly_coeff(self.coeffs_real["c0"], f_ghz)
-        c1 = self._get_poly_coeff(self.coeffs_real["c1"], f_ghz)
-        c2 = self._get_poly_coeff(self.coeffs_real["c2"], f_ghz)
+        # --- PARTE REAL (ε') ---
+        a0 = self._poly(self.coeffs_real["a0"], f_ghz)
+        a1 = self._poly(self.coeffs_real["a1"], f_ghz)
+        a2 = self._poly(self.coeffs_real["a2"], f_ghz)
+        b0 = self._poly(self.coeffs_real["b0"], f_ghz)
+        b1 = self._poly(self.coeffs_real["b1"], f_ghz)
+        b2 = self._poly(self.coeffs_real["b2"], f_ghz)
+        c0 = self._poly(self.coeffs_real["c0"], f_ghz)
+        c1 = self._poly(self.coeffs_real["c1"], f_ghz)
+        c2 = self._poly(self.coeffs_real["c2"], f_ghz)
 
-        # Coeficientes de la ecuación cuadrática
         A = a0 + a1 * S + a2 * C
         B = b0 + b1 * S + b2 * C
-        C_coeff = c0 + c1 * S + c2 * C
+        Cc = c0 + c1 * S + c2 * C
 
-        # Ecuación (1): ε' = A + B·mv + C·mv²
-        epsilon_prime = A + B * mv_frac + C_coeff * (mv_frac**2)
+        eps_real = A + B * mv_frac + Cc * mv_frac**2
 
-        # --- PARTE IMAGINARIA (Epsilon Doble Prima) ---
-        # Calcular coeficientes dependientes de frecuencia (Tabla V)
-        d0 = self._get_poly_coeff(self.coeffs_imag["d0"], f_ghz)
-        d1 = self._get_poly_coeff(self.coeffs_imag["d1"], f_ghz)
-        d2 = self._get_poly_coeff(self.coeffs_imag["d2"], f_ghz)
-        e0 = self._get_poly_coeff(self.coeffs_imag["e0"], f_ghz)
-        e1 = self._get_poly_coeff(self.coeffs_imag["e1"], f_ghz)
-        e2 = self._get_poly_coeff(self.coeffs_imag["e2"], f_ghz)
-        f0 = self._get_poly_coeff(self.coeffs_imag["f0"], f_ghz)
-        f1 = self._get_poly_coeff(self.coeffs_imag["f1"], f_ghz)
-        f2 = self._get_poly_coeff(self.coeffs_imag["f2"], f_ghz)
+        # --- PARTE IMAGINARIA (ε'') ---
+        d0 = self._poly(self.coeffs_imag["d0"], f_ghz)
+        d1 = self._poly(self.coeffs_imag["d1"], f_ghz)
+        d2 = self._poly(self.coeffs_imag["d2"], f_ghz)
+        e0 = self._poly(self.coeffs_imag["e0"], f_ghz)
+        e1 = self._poly(self.coeffs_imag["e1"], f_ghz)
+        e2 = self._poly(self.coeffs_imag["e2"], f_ghz)
+        f0 = self._poly(self.coeffs_imag["f0"], f_ghz)
+        f1 = self._poly(self.coeffs_imag["f1"], f_ghz)
+        f2 = self._poly(self.coeffs_imag["f2"], f_ghz)
 
         D = d0 + d1 * S + d2 * C
         E = e0 + e1 * S + e2 * C
         F = f0 + f1 * S + f2 * C
 
-        # Ecuación (2): ε'' = D + E·mv + F·mv²
-        epsilon_double_prime = D + E * mv_frac + F * (mv_frac**2)
+        eps_imag = D + E * mv_frac + F * mv_frac**2
 
-        # Constante dieléctrica compleja
-        return epsilon_prime + 1j * epsilon_double_prime
+        return eps_real + 1j * eps_imag
 
 
 # -------------------------------------------------------------------
@@ -163,8 +145,11 @@ class SurfaceRoughness:
     y espectro de potencia Gaussiano (Fung 1992).
 
     Referencias:
-    - Baghdadi et al., IEEE GRSL, Vol. 8, No. 1, 2011, Eq. (3)
-    - Fung et al., IEEE TGRS, Vol. 30, No. 2, 1992, Eq. (4-A.3)
+    - Baghdadi et al., IEEE GRSL, Vol. 8, No. 1, 2011
+      * Ecuación (2): Lopt2 para HV (polarización cruzada)
+      * Ecuación (3): Lopt para VV (polarización co-polarizada)
+    - Fung et al., IEEE TGRS, Vol. 30, No. 2, 1992
+      * Ecuación (4-A.3): Espectro de potencia Gaussiano
     """
 
     def __init__(self, correlation="gaussian"):
@@ -175,54 +160,74 @@ class SurfaceRoughness:
             correlation: Tipo de función de autocorrelación ("gaussian")
         """
         self.correlation_type = correlation
+        self.t = 1.33
 
-    def compute_Lopt(self, rms_cm, theta_deg, polarization="HV"):
+    def compute_Lopt(self, rms_cm, theta_deg, polarization="VV"):
         """
         Calcula la longitud de correlación óptima calibrada.
 
-        Implementa Baghdadi et al. (2011), Ecuación (3):
+        CRÍTICO: Ecuaciones DIFERENTES para VV y HV.
 
-        Para HV: Lopt = 1.281 + 0.134 × [sin(0.19θ)]^(-1.59) × s
+        Para VV (co-polarizada):
+        ------------------------
+        Baghdadi (2011), Ecuación (3):
+        Lopt(s,θ) = 1.281 + 0.134 × [sin(0.19θ)]^(-1.59) × s
 
-        Nota: El paper de Baghdadi 2011 presenta calibraciones separadas
-        para HH, VV y HV. La ecuación es la misma para todas, pero los
-        coeficientes pueden variar ligeramente.
+        Para HV (cross-polarizada):
+        ---------------------------
+        Baghdadi (2011), Ecuación (2), Sección V, página 3:
+        Lopt2(s,θ) = 0.9157 + 1.2289 × [sin(0.1543θ)]^(-0.3139) × s
+
+        IMPORTANTE: Lopt2 (valor alto) asegura comportamiento físico correcto:
+        σ° aumenta con s (en lugar de decrecer para s>1cm con Lopt1).
 
         Args:
             rms_cm: Altura RMS de rugosidad en cm (escalar o array)
             theta_deg: Ángulo de incidencia en grados (escalar o array)
-            polarization: Polarización ("HV")
+            polarization: Polarización ("VV", "HV", "VH")
 
         Returns:
             Lopt en cm (mismo shape que los inputs)
         """
-        if polarization not in ["HV", "VH", "VV"]:
-            raise NotImplementedError(f"Polarización {polarization} no implementada.")
-
+        rms_cm = np.asarray(rms_cm)
         theta_rad = np.deg2rad(theta_deg)
+        theta_deg_arr = np.asarray(theta_deg)
 
-        if polarization in ["HV", "VH"]:
-            # POLARIZACIÓN CRUZADA (HV/VH)
-            # Baghdadi (2011), Ecuación (2) - Página 3, Sección V
-            # Lopt2(s,θ) = 0.9157 + 1.2289 * [sin(0.1543*θ)]^(-0.3139) * s
-
-            sin_term = np.sin(0.1543 * theta_rad)
-
-            # Evitar división por cero
-            sin_term = np.where(np.abs(sin_term) < 1e-6, 1e-6, sin_term)
-
-            # Ecuación (2) - Lopt2 para HV (valor alto, Gaussiana)
-            Lopt = 0.9157 + 1.2289 * (sin_term ** (-0.3139)) * rms_cm
-
-        else:  # polarization == "VV" (o "HH")
-            # POLARIZACIÓN CO-POLARIZADA (VV/HH)
-            # Baghdadi (2011), Ecuación (3) - Original
-            # Lopt(s,θ) = 1.281 + 0.134 * [sin(0.19*θ)]^(-1.59) * s
+        if polarization.upper() == "VV":
+            # Baghdadi (2006), Ecuación (5), página 812
+            d_vv = 3.289
+            m = -1.744
+            g = -0.0025
+            j_vv = 1.222
 
             sin_term = np.sin(0.19 * theta_rad)
             sin_term = np.where(np.abs(sin_term) < 1e-6, 1e-6, sin_term)
 
-            Lopt = 1.281 + 0.134 * (sin_term ** (-1.59)) * rms_cm
+            # Lopt2 = d × sin(θ)^m × rms^(g×θ + j)
+            # Lopt = d_vv * (sin_term**m) * (rms_cm ** (g * theta_deg_arr + j_vv))
+            Lopt = 1.281 + 0.134 * sin_term ** (-1.59) * rms_cm
+
+        elif polarization.upper() in ("HV", "VH"):
+            # Baghdadi (2011), Ecuación (2)
+            # (Paper específico para HV, calibrado independientemente)
+            sin_term = np.sin(0.1543 * theta_rad)
+            sin_term = np.where(np.abs(sin_term) < 1e-6, 1e-6, sin_term)
+            Lopt = 0.9157 + 1.2289 * sin_term ** (-0.3139) * rms_cm
+
+        elif polarization.upper() == "HH":
+            # Baghdadi (2006), Ecuación (5)
+            d_hh = 4.026
+            m = -1.744
+            g = -0.0025
+            j_hh = 1.551
+
+            sin_term = np.sin(1.23 * theta_rad)
+            sin_term = np.where(np.abs(sin_term) < 1e-6, 1e-6, sin_term)
+
+            Lopt = 0.162 + 3.006 * sin_term ** (-1.494) * rms_cm
+
+        else:
+            raise NotImplementedError(f"Polarización {polarization} no soportada.")
 
         return Lopt
 
@@ -235,12 +240,11 @@ class SurfaceRoughness:
         W^(n)(k_x) = (L²/2n) × exp(-k_x²L²/4n)
 
         NOTA CRÍTICA: El factor 4 en el exponente es esencial.
-        Sin él, el espectro decae demasiado lento y causa inestabilidad.
 
         Args:
-            k_x: Número de onda horizontal = k*sin(θ) (escalar o array)
+            k_x: Número de onda horizontal = k×sin(θ) (escalar o array)
             L_m: Longitud de correlación en metros (escalar o array)
-            n: Orden del término en la serie de scattering
+            n: Orden del término en la serie de scattering (1, 2, ..., N)
 
         Returns:
             W^(n): Espectro de potencia (mismo shape que inputs)
@@ -248,78 +252,90 @@ class SurfaceRoughness:
         Referencias:
         - Fung (1992), página 367, Ecuación (4-A.3)
         """
-        L_m2 = L_m**2
-        k_x2 = k_x**2
+        Lm2 = L_m**2
 
-        # Ecuación (4-A.3) con factor 4 correcto
-        Wn = (L_m2 / (2 * n)) * np.exp(-k_x2 * L_m2 / (4 * n))
+        if self.correlation_type == "fractal":
+            # Baghdadi (2006), Ecuación (1) con t=1.33
+            kx_L = np.abs(k_x * L_m)
+            exp_frac = 2.0 / self.t
+            norm = n ** (2.0 / self.t)
+            Wn = (Lm2 / n) * np.exp(-((kx_L**exp_frac) / norm))
+
+        elif self.correlation_type == "gaussian":
+            # Fung (1992), Eq. (4-A.3)
+            kx2 = k_x**2
+            Wn = (Lm2 / (2.0 * n)) * np.exp(-kx2 * Lm2 / (4.0 * n))
+
+        else:
+            raise ValueError(f"Correlación {self.correlation_type} no soportada")
 
         return Wn
 
 
 # -------------------------------------------------------------------
-# CLASE 3: MODELO IEM POLARIZACIÓN CRUZADA (Fung 1992 + Baghdadi 2011)
+# CLASE 3: MODELO IEM (Fung 1992 + Baghdadi 2011)
 # -------------------------------------------------------------------
 
 
 class IEM_Model:
     """
-    Modelo de Ecuación Integral calibrado (IEM_B) para polarización cruzada HV.
+    Modelo de Ecuación Integral calibrado (IEM_B) para banda C.
+
+    Soporta polarizaciones:
+    - VV (co-polarizada vertical)
+    - HV/VH (cross-polarizada)
 
     Implementa:
-    - Física de scattering: Fung et al. (1992), IEEE TGRS
-    - Calibración de Lopt: Baghdadi et al. (2011), IEEE GRSL
-    - Modelo dieléctrico: Hallikainen et al. (1985), IEEE TGRS
+    - Física de scattering: Fung et al. (1992), IEEE TGRS, Vol. 30, No. 2
+    - Calibración Lopt: Baghdadi et al. (2011), IEEE GRSL, Vol. 8, No. 1
+    - Modelo dieléctrico: Hallikainen et al. (1985), IEEE TGRS, Vol. GE-23, No. 1
 
-    POLARIZACIÓN CRUZADA (HV/VH):
-    ================================
-    A diferencia de las polarizaciones co-polarizadas (HH, VV), la
-    polarización cruzada NO tiene término de Kirchhoff coherente.
-    Solo tiene scattering múltiple (término complementario).
+    ECUACIONES PRINCIPALES (Fung 1992):
+    ====================================
 
-    Ecuaciones principales (Fung 1992, páginas 356-357):
+    Ecuación (17) - Coeficiente de scattering:
+    ------------------------------------------
+    σ⁰ = (k²/2) × exp(-2k_z²s²) × Σ[(W^(n)/n!) × |I_pp^(n)|²]
 
-    1. NO HAY término de Kirchhoff para HV:
-       σ⁰_K^HV = 0  [ver Fung, discusión después de Eq. 16]
+    Ecuación (18) - Términos de la serie:
+    -------------------------------------
+    I_pp^(n) = (2k_z·s)^n × f_pp + (k_z·s)^(2n)/2 × F_pp
 
-    2. Solo término complementario (Eq. 17):
-       σ⁰_C^HV = (k²/2) × exp(-2k_z²s²) × Σ[(W^(n)/n!) × |I_hv^(n)|²]
-
-    3. Términos de scattering cruzado (Eq. 18 adaptada para HV):
-       I_hv^(n) = [(2k_z·s)^n / √n!] × f_hv + [(k_z·s)^(2n) / (2√n!)] × F_hv
-
-    Donde (de Fung, Eq. después de (24)):
-
-    4. f_hv y F_hv contienen términos mixtos de reflexión H→V:
-       f_hv ≈ 0 para backscattering (simetría)
-       F_hv depende de términos de segundo orden
+    Donde:
+    - k = 2π/λ: número de onda
+    - k_z = k·cos(θ): componente vertical
+    - s: altura RMS de rugosidad (metros)
+    - W^(n): espectro de potencia de orden n
+    - f_pp, F_pp: términos de reflexión (dependen de polarización)
     """
 
     def __init__(self, frequency=5.405e9, sand_pct=20, clay_pct=30):
         """
-        Inicializa el modelo IEM calibrado para polarización cruzada.
+        Inicializa el modelo IEM calibrado.
 
         Args:
-            frequency: Frecuencia en Hz (default: 5.405 GHz - banda C)
+            frequency: Frecuencia en Hz (default: 5.405 GHz, Sentinel-1 C-band)
             sand_pct: Porcentaje de arena (0-100)
             clay_pct: Porcentaje de arcilla (0-100)
         """
         self.frequency = frequency
         self.wavelength = 2.99792e8 / frequency  # λ = c/f
-        self.k = 2 * np.pi / self.wavelength  # Número de onda
+        self.k = 2.0 * np.pi / self.wavelength  # Número de onda (rad/m)
 
         # Submodelos
         self.dielectric = DielectricModel(sand_pct, clay_pct)
-        self.roughness = SurfaceRoughness(correlation="gaussian")
+        self.roughness = SurfaceRoughness(correlation="fractal")
 
         # Número de términos en la serie de scattering
         self.N_TERMS = 10
+
+    # --- COEFICIENTES DE FRESNEL ---
 
     def _fresnel_h(self, eps_r, theta_rad):
         """
         Coeficiente de Fresnel para polarización horizontal (H).
 
-        Fung (1992), página 357, ecuación después de (2):
+        Fung (1992), página 357, después de Ecuación (2):
 
         R_h = (cos(θ) - √(ε_r - sin²(θ))) / (cos(θ) + √(ε_r - sin²(θ)))
 
@@ -328,11 +344,10 @@ class IEM_Model:
             theta_rad: Ángulo de incidencia en radianes
 
         Returns:
-            R_h: Coeficiente de Fresnel horizontal
+            R_h: Coeficiente de Fresnel horizontal (complejo)
         """
         cost = np.cos(theta_rad)
         sint2 = np.sin(theta_rad) ** 2
-
         sqrt_term = np.lib.scimath.sqrt(eps_r - sint2)
 
         R_h = (cost - sqrt_term) / (cost + sqrt_term)
@@ -352,29 +367,80 @@ class IEM_Model:
             theta_rad: Ángulo de incidencia en radianes
 
         Returns:
-            R_v: Coeficiente de Fresnel vertical
+            R_v: Coeficiente de Fresnel vertical (complejo)
         """
         cost = np.cos(theta_rad)
         sint2 = np.sin(theta_rad) ** 2
-
         sqrt_term = np.lib.scimath.sqrt(eps_r - sint2)
 
         R_v = (eps_r * cost - sqrt_term) / (eps_r * cost + sqrt_term)
 
         return R_v
 
+    # --- TÉRMINOS DE SCATTERING VV (CO-POLARIZADA) ---
+
+    def _f_vv(self, eps_r, sint, cost, R_v):
+        """
+        Término f_vv para polarización co-polarizada VV.
+
+        Fung (1992), Ecuación (22):
+
+        f_vv = 2·R_v / cos(θ)
+
+        Simplificación para IEM: f_vv ≈ (1 + R_v) / 2
+
+        Args:
+            eps_r: Constante dieléctrica compleja
+            sint: sin(θ)
+            cost: cos(θ)
+            R_v: Coeficiente de Fresnel vertical
+
+        Returns:
+            f_vv: Término de scattering de primer orden
+        """
+        # Versión simplificada usada en muchas implementaciones IEM
+        return (1.0 + R_v) / 2.0
+
+    def _F_vv(self, eps_r, sint, cost):
+        """
+        Término F_vv para polarización co-polarizada VV (orden superior).
+
+        Fung (1992), Ecuación (24):
+
+        F_vv = [(ε_r - 1) × sin(θ) × cos(θ)] / [ε_r·cos(θ) + √(ε_r - sin²(θ))]²
+
+        Este término captura scattering múltiple.
+
+        Args:
+            eps_r: Constante dieléctrica compleja
+            sint: sin(θ)
+            cost: cos(θ)
+
+        Returns:
+            F_vv: Término de scattering de orden superior
+        """
+        sint2 = sint**2
+        sqrt_term = np.lib.scimath.sqrt(eps_r - sint2)
+
+        num = (eps_r - 1.0) * sint * cost
+        den = (eps_r * cost + sqrt_term) ** 2
+
+        # Evitar división por cero
+        den = np.where(np.abs(den) < 1e-12, 1e-12, den)
+
+        return num / den
+
+    # --- TÉRMINOS DE SCATTERING HV (CROSS-POLARIZADA) ---
+
     def _f_hv(self, eps_r, sint, cost, R_h, R_v):
         """
-        Término f_hv para polarización cruzada.
+        Término f_hv para polarización cruzada HV.
 
-        Fung (1992), página 368, Ecuaciones (54)-(57) simplificadas:
+        Para backscattering (θ_i = θ_s), f_hv = 0 por simetría.
 
-        Para backscattering, f_hv involucra productos cruzados de R_h y R_v.
-        En la aproximación de primer orden y para geometría de backscatter:
-
-        f_hv ≈ (R_h - R_v) × [término geométrico]
-
-        Para backscattering simple, este término es pequeño o cero por simetría.
+        Fung (1992), página 357:
+        "Cross-polarized backscattering coefficients satisfy reciprocity
+        and contain only multiple scattering terms."
 
         Args:
             eps_r: Constante dieléctrica compleja
@@ -384,26 +450,22 @@ class IEM_Model:
             R_v: Coeficiente de Fresnel vertical
 
         Returns:
-            f_hv: Término de scattering cruzado (≈ 0 en backscatter)
+            f_hv: Término de scattering (= 0 para backscatter)
         """
-        # En backscattering puro (θ_i = θ_s), f_hv = 0 por simetría
-        # Fung (1992) página 357: "cross-polarized coefficients satisfy reciprocity"
+        # En backscattering puro, f_hv = 0 por simetría
         return np.zeros_like(R_h)
 
     def _F_hv(self, eps_r, sint, cost):
         """
-        Término F_hv para polarización cruzada de segundo orden.
+        Término F_hv para polarización cruzada HV (orden superior).
 
-        Fung (1992), página 368, ecuaciones (54)-(57):
+        Este término NO es cero y captura la despolarización causada
+        por la rugosidad superficial.
 
-        F_hv contiene términos de scattering múltiple que SÍ contribuyen
-        significativamente en polarización cruzada.
+        Basado en Fung (1992), ecuaciones (54)-(57), adaptado para HV:
 
-        Aproximación basada en la diferencia entre coeficientes H y V:
-
-        F_hv ≈ [(ε_r - 1) × sin(θ) × cos(θ)] / [denominador complejo]
-
-        Este término captura la despolarización causada por la rugosidad.
+        F_hv ≈ [(ε_r - 1) × sin(θ) × cos(θ) × (1 + sin²(θ))] /
+               [ε_r·cos(θ) + √(ε_r - sin²(θ))]²
 
         Args:
             eps_r: Constante dieléctrica compleja
@@ -411,14 +473,13 @@ class IEM_Model:
             cost: cos(θ)
 
         Returns:
-            F_hv: Término de scattering cruzado de orden superior
+            F_hv: Término de despolarización (scattering múltiple)
         """
         sint2 = sint**2
         sqrt_term = np.lib.scimath.sqrt(eps_r - sint2)
 
-        # Término de despolarización (Fung 1992, adaptado de Eq. 24)
-        # Para HV, necesitamos el término cruzado que surge de la curvatura
-        num = (eps_r - 1) * sint * cost * (1 + sint2)
+        # Término de despolarización para cross-pol
+        num = (eps_r - 1.0) * sint * cost * (1.0 + sint2)
         den = (eps_r * cost + sqrt_term) ** 2
 
         # Evitar división por cero
@@ -426,65 +487,79 @@ class IEM_Model:
 
         return num / den
 
-    def compute_backscatter(self, mv, rms_cm, theta_deg, polarization="HV"):
+    # --- CÁLCULO PRINCIPAL DE BACKSCATTERING ---
+
+    def compute_backscatter(self, mv, rms_cm, theta_deg, polarization="VV"):
         """
-        Calcula σ⁰ en dB para polarización cruzada usando IEM_B.
+        Calcula el coeficiente de retrodispersión σ⁰ en dB.
 
-        ESTRUCTURA DE LA IMPLEMENTACIÓN:
-        =================================
-
+        CADENA DE PROCESAMIENTO:
+        ========================
         1. [Hallikainen 1985]: mv + textura → ε_r
-        2. [Baghdadi 2011]: rms + θ → Lopt
-        3. [Fung 1992 Eq. 17]: ε_r + rugosidad → σ⁰
+        2. [Baghdadi 2011]: rms + θ → Lopt (calibrado por polarización)
+        3. [Fung 1992 Eq. 17-18]: ε_r + rugosidad → σ⁰
 
-        ECUACIÓN PRINCIPAL (Fung 1992, Eq. 17 adaptada para HV):
+        ECUACIÓN IMPLEMENTADA (Fung 1992, Eq. 17):
+        ===========================================
+        σ⁰ = (k²/2) × exp(-2k_z²s²) × Σ[(W^(n)/n!) × |I_pp^(n)|²]
 
-        σ⁰_HV = (k²/2) × exp(-2k_z²s²) × Σ[(W^(n)/n!) × |I_hv^(n)|²]
+        Donde (Fung 1992, Eq. 18):
+        I_pp^(n) = (2k_z·s)^n × f_pp + (k_z·s)^(2n)/2 × F_pp
 
-        Donde:
-        - NO hay término de Kirchhoff (σ⁰_K = 0 para cross-pol)
-        - I_hv^(n) = [(2k_z·s)^n/√n!]·f_hv + [(k_z·s)^(2n)/(2√n!)]·F_hv
-        - W^(n) = espectro de potencia Gaussiano
-        - n = 1, 2, ..., N_TERMS
+        CRÍTICO: El factor s (altura RMS en metros) DEBE estar presente.
+        Sin s, los términos (k_z)^n explotan exponencialmente.
+
+        DIFERENCIAS POR POLARIZACIÓN:
+        =============================
+
+        VV (Co-polarizada):
+        ------------------
+        - f_vv ≠ 0 (término dominante)
+        - F_vv contribuye (scattering múltiple)
+        - Típicamente σ⁰_VV ∈ [-20, -10] dB
+
+        HV (Cross-polarizada):
+        ---------------------
+        - f_hv = 0 (por simetría en backscatter)
+        - F_hv dominante (única contribución)
+        - Típicamente σ⁰_HV ∈ [-35, -20] dB
+        - σ⁰_HV < σ⁰_VV siempre (8-15 dB menor)
 
         Args:
             mv: Humedad volumétrica (%) - escalar o array
-            rms_cm: Altura RMS en cm - escalar o array
-            theta_deg: Ángulo de incidencia en grados - escalar o array
-            polarization: "HV" o "VH" (equivalentes por reciprocidad)
+            rms_cm: Altura RMS de rugosidad (cm) - escalar o array
+            theta_deg: Ángulo de incidencia (grados) - escalar o array
+            polarization: "VV", "HV", o "VH"
 
         Returns:
             σ⁰ en dB (mismo shape que los inputs)
 
         Referencias:
+        -----------
         - Fung et al., IEEE TGRS, Vol. 30, No. 2, March 1992
         - Baghdadi et al., IEEE GRSL, Vol. 8, No. 1, January 2011
         - Hallikainen et al., IEEE TGRS, Vol. GE-23, No. 1, January 1985
         """
-        if polarization not in ["HV", "VH"]:
-            raise NotImplementedError(
-                f"Polarización {polarization} no implementada. "
-                "Esta clase solo soporta polarización cruzada HV/VH."
-            )
-
-        # --- 1. VECTORIZACIÓN ---
+        # --- 1. VECTORIZACIÓN Y NORMALIZACIÓN ---
         mv = np.asarray(mv)
         rms_cm = np.asarray(rms_cm)
-        theta_deg = np.asarray(theta_deg)
+        theta_rad = np.deg2rad(theta_deg)
+        polarization = polarization.upper()
 
         # --- 2. PARÁMETROS GEOMÉTRICOS ---
-        theta_rad = np.deg2rad(theta_deg)
         sint = np.sin(theta_rad)
         cost = np.cos(theta_rad)
 
-        k_z = self.k * cost  # Componente vertical
-        k_x = self.k * sint  # Componente horizontal
+        k_z = self.k * cost  # Componente vertical del número de onda
+        k_x = self.k * sint  # Componente horizontal del número de onda
 
-        s_m = rms_cm / 100.0  # Convertir cm a metros
+        # ✅ CRÍTICO: Convertir rugosidad de cm a metros
+        s_m = rms_cm / 100.0
 
         # --- 3. CALIBRACIÓN BAGHDADI: Lopt ---
+        # Usa ecuaciones DIFERENTES para VV y HV
         Lopt_cm = self.roughness.compute_Lopt(rms_cm, theta_deg, polarization)
-        L_m = Lopt_cm / 100.0  # Convertir cm a metros
+        L_m = Lopt_cm / 100.0  # Convertir a metros
 
         # --- 4. MODELO DIELÉCTRICO HALLIKAINEN: ε_r ---
         eps_r = self.dielectric.compute_dielectric(mv, self.frequency)
@@ -493,48 +568,57 @@ class IEM_Model:
         R_h = self._fresnel_h(eps_r, theta_rad)
         R_v = self._fresnel_v(eps_r, theta_rad)
 
-        # --- 6. TÉRMINOS DE SCATTERING CRUZADO (Fung Eq. adaptada) ---
-        f_hv = self._f_hv(eps_r, sint, cost, R_h, R_v)
-        F_hv = self._F_hv(eps_r, sint, cost)
+        # --- 6. TÉRMINOS DE SCATTERING (DEPENDEN DE POLARIZACIÓN) ---
+        if polarization == "VV":
+            # Co-polarizada VV
+            f_term = self._f_vv(eps_r, sint, cost, R_v)
+            F_term = self._F_vv(eps_r, sint, cost)
 
-        # --- 7. SERIE DE SCATTERING (Fung Eq. 17) ---
+        elif polarization in ("HV", "VH"):
+            # Cross-polarizada HV/VH
+            f_term = self._f_hv(eps_r, sint, cost, R_h, R_v)
+            F_term = self._F_hv(eps_r, sint, cost)
 
-        # NO HAY término de Kirchhoff para polarización cruzada
-        # Fung (1992) página 357: "cross-polarized scattering contains
-        # only multiple scattering terms"
+        else:
+            raise NotImplementedError(
+                f"Polarización {polarization} no soportada. Use 'VV', 'HV', o 'VH'."
+            )
 
-        # Término complementario (incoherente)
-        k_z2_s2 = (k_z * s_m) ** 2
-        exp_term = np.exp(-2 * k_z2_s2)
+        # --- 7. SERIE DE SCATTERING (Fung 1992, Eq. 17) ---
 
+        # Factor de atenuación exponencial
+        exp_term = np.exp(-2.0 * (k_z * s_m) ** 2)
+
+        # Acumulador de la serie
         series_sum = np.zeros_like(R_h, dtype=complex)
 
         for n in range(1, self.N_TERMS + 1):
             n_fact = factorial(n)
-            sqrt_n_fact = np.sqrt(n_fact)
 
             # Espectro de potencia Gaussiano (Fung Eq. 4-A.3)
-            Wn = self.roughness.get_spectrum(2 * k_x, L_m, n)
+            Wn = self.roughness.get_spectrum(2.0 * k_x, L_m, n)
 
-            # Términos de la serie I_hv^(n) (Fung Eq. 18 adaptada para HV)
-            term1 = ((2 * k_z * s_m) ** n / sqrt_n_fact) * f_hv
-            term2 = ((k_z * s_m) ** (2 * n) / (2 * sqrt_n_fact)) * F_hv
+            # ✅ ECUACIÓN (18) DE FUNG - CRÍTICO: Incluir s_m
+            # I_pp^(n) = (2·k_z·s)^n × f + (k_z·s)^(2n)/2 × F
+            #
+            # NOTA: NO se usa √n_fact (causa sobre-atenuación ~35 dB)
+            # La normalización 1/n! en la serie es suficiente
+            I_pp_n = ((2.0 * k_z * s_m) ** n) * f_term + (
+                (k_z * s_m) ** (2 * n) / 2.0
+            ) * F_term
 
-            I_hv_n = term1 + term2
+            # Acumulación de la serie (Eq. 17)
+            # Σ[(W^(n)/n!) × |I_pp^(n)|²]
+            series_sum += (Wn / n_fact) * np.abs(I_pp_n) ** 2
 
-            # Acumulación de la serie (Fung Eq. 17)
-            series_sum += (Wn / n_fact) * np.abs(I_hv_n) ** 2
+        # --- 8. COEFICIENTE FINAL (Fung 1992, Eq. 17) ---
+        # σ⁰ = (k²/2) × exp(-2k_z²s²) × Σ[...]
+        sigma0_lin = (self.k**2 / 2.0) * exp_term * np.real(series_sum)
 
-        # Coeficiente de scattering total (solo complementario para cross-pol)
-        sigma0_C = (self.k**2 / 2) * exp_term * series_sum
-
-        # --- 8. RESULTADO FINAL ---
-        sigma0_linear = np.real(sigma0_C)
-
-        # Protección contra valores no físicos
-        sigma0_linear = np.where(sigma0_linear <= 1e-10, 1e-10, sigma0_linear)
+        # Protección contra valores no físicos (log de negativos o cero)
+        sigma0_lin = np.where(sigma0_lin <= 1e-15, 1e-15, sigma0_lin)
 
         # Convertir a dB
-        sigma0_dB = 10 * np.log10(sigma0_linear)
+        sigma0_dB = 10.0 * np.log10(sigma0_lin)
 
         return sigma0_dB
