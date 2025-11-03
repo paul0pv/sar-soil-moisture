@@ -1,5 +1,3 @@
-# validation/sentinel1_validation.py
-
 """
 Validación del modelo con datos reales de Sentinel-1 IW
 
@@ -8,7 +6,7 @@ Requiere:
 2. Procesamiento con SNAP (calibración radiométrica, filtrado speckle)
 3. Datos in situ sincronizados de campañas de campo
 
-Sitios sugeridos (con datos públicos disponibles):
+Sitios sugeridos (datos públicos disponibles):
 - ISMN (International Soil Moisture Network): >60 redes globales
 - SMAP Validation Sites
 - ESA CCI Soil Moisture validation sites
