@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from models import IEM_Model
+from core.models import IEM_Model
 
 
 def run_monotonicity_test():

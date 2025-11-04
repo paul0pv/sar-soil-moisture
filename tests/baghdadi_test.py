@@ -1,5 +1,5 @@
 import numpy as np
-from models import IEM_Model
+from core.models import IEM_Model
 
 
 def run_baghdadi_test():

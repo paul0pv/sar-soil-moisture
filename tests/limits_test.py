@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import factorial
-from models import IEM_Model, SurfaceRoughness
+from core.models import IEM_Model, SurfaceRoughness
 
 
 def run_limits_test():
