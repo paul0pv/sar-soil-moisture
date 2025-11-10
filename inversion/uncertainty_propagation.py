@@ -58,6 +58,10 @@ class UncertaintyPropagator:
         theta: float,
         polarization: str = "VV",
         delta: float = 1e-5,
+        *,
+        delta_mv: float | None = None,
+        delta_rms: float | None = None,
+        delta_theta: float | None = None,
     ) -> dict:
         """
         Calcula matriz Jacobiana de sensibilidades.
@@ -77,21 +81,28 @@ class UncertaintyPropagator:
         # Punto central
         sigma0_center = self.model.compute_backscatter(mv, rms, theta, polarization)
 
+        # Pasos adaptativos por variable
+        def _delta_rel(x, rel, abs_min):
+            return max(abs_min, rel * max(1.0, abs(x)))
+        h_mv    = delta_mv    if delta_mv    is not None else _delta_rel(mv,    rel=1e-3, abs_min=1e-3)
+        h_rms   = delta_rms   if delta_rms   is not None else _delta_rel(rms,   rel=1e-3, abs_min=1e-3)
+        h_theta = delta_theta if delta_theta is not None else _delta_rel(theta, rel=1e-3, abs_min=1e-2)
+
         # Derivadas parciales (diferencias centrales)
         dsigma_dmv = (
-            self.model.compute_backscatter(mv + delta, rms, theta, polarization)
-            - self.model.compute_backscatter(mv - delta, rms, theta, polarization)
-        ) / (2 * delta)
+            self.model.compute_backscatter(mv + h_mv, rms, theta, polarization)
+            - self.model.compute_backscatter(mv - h_mv, rms, theta, polarization)
+        ) / (2 * h_mv)
 
         dsigma_drms = (
-            self.model.compute_backscatter(mv, rms + delta, theta, polarization)
-            - self.model.compute_backscatter(mv, rms - delta, theta, polarization)
-        ) / (2 * delta)
+            self.model.compute_backscatter(mv, rms + h_rms, theta, polarization)
+            - self.model.compute_backscatter(mv, rms - h_rms, theta, polarization)
+        ) / (2 * h_rms)
 
         dsigma_dtheta = (
-            self.model.compute_backscatter(mv, rms, theta + delta, polarization)
-            - self.model.compute_backscatter(mv, rms, theta - delta, polarization)
-        ) / (2 * delta)
+            self.model.compute_backscatter(mv, rms, theta + h_theta, polarization)
+            - self.model.compute_backscatter(mv, rms, theta - h_theta, polarization)
+        ) / (2 * h_theta)
 
         return {
             "sigma0": float(sigma0_center),
@@ -111,6 +122,8 @@ class UncertaintyPropagator:
         sigma_rms: float = 0.3,  # cm (error medición rugosidad)
         sigma_theta: float = 0.5,  # ° (error geolocalización)
         rms_known: bool = False,
+        cov: np.ndarray | None = None,
+        jacobian_kwargs: dict | None = None,
     ) -> dict:
         """
         Propagación analítica usando expansión de Taylor de primer orden.
@@ -132,8 +145,10 @@ class UncertaintyPropagator:
             Dict con incertidumbres propagadas y diagnósticos
         """
         # Calcular Jacobiano
-        J = self.compute_jacobian(mv_true, rms_true, theta_true, polarization)
-
+        J = self.compute_jacobian(
+            mv_true, rms_true, theta_true, polarization, **(jacobian_kwargs or {})
+        )
+        
         # Verificar singularidad
         if abs(J["dsigma_dmv"]) < 1e-6:
             return {
@@ -154,11 +169,20 @@ class UncertaintyPropagator:
         if rms_known:
             sigma_rms = 0.0  # Rugosidad conocida exactamente
 
-        var_mv = (
-            (dmv_dsigma * sigma_sensor) ** 2
-            + (dmv_drms * sigma_rms) ** 2
-            + (dmv_dtheta * sigma_theta) ** 2
-        )
+        g = np.array([dmv_dsigma, dmv_drms, dmv_dtheta], dtype=float)
+        if cov is not None:
+            cov = np.asarray(cov, dtype=float)
+            if cov.shape != (3, 3):
+                raise ValueError("cov debe ser 3x3 en orden [sigma0, rms, theta].")
+            var_mv = float(g @ cov @ g)
+            sigma_sensor_eff, sigma_rms_eff, sigma_theta_eff = np.sqrt(np.diag(cov))
+        else:
+            var_mv = float(
+                (dmv_dsigma * sigma_sensor) ** 2
+                + (dmv_drms * sigma_rms) ** 2
+                + (dmv_dtheta * sigma_theta) ** 2
+            )
+            sigma_sensor_eff, sigma_rms_eff, sigma_theta_eff = sigma_sensor, sigma_rms, sigma_theta
 
         sigma_mv = np.sqrt(var_mv)
 
@@ -169,15 +193,9 @@ class UncertaintyPropagator:
 
         # Desglose de contribuciones
         total_var = var_mv
-        contrib_sensor = (
-            (dmv_dsigma * sigma_sensor) ** 2 / total_var * 100 if total_var > 0 else 0
-        )
-        contrib_rms = (
-            (dmv_drms * sigma_rms) ** 2 / total_var * 100 if total_var > 0 else 0
-        )
-        contrib_theta = (
-            (dmv_dtheta * sigma_theta) ** 2 / total_var * 100 if total_var > 0 else 0
-        )
+        contrib_sensor = ((dmv_dsigma * sigma_sensor_eff) ** 2 / total_var * 100) if total_var > 0 else 0
+        contrib_rms    = ((dmv_drms    * sigma_rms_eff)    ** 2 / total_var * 100) if total_var > 0 else 0
+        contrib_theta  = ((dmv_dtheta  * sigma_theta_eff)  ** 2 / total_var * 100) if total_var > 0 else 0
 
         # Clasificar calidad
         quality = classify_quality_from_uncertainty(sigma_mv)
@@ -215,9 +233,9 @@ class UncertaintyPropagator:
                 "mv": mv_true,
                 "rms": rms_true,
                 "theta": theta_true,
-                "sigma_sensor": sigma_sensor,
-                "sigma_rms": sigma_rms,
-                "sigma_theta": sigma_theta,
+                "sigma_sensor": float(sigma_sensor),
+                "sigma_rms": float(sigma_rms),
+                "sigma_theta": float(sigma_theta),
             },
         }
 
@@ -232,6 +250,9 @@ class UncertaintyPropagator:
         sigma_theta: float = 0.5,
         n_samples: int = ANALYSIS.N_MC_SAMPLES,
         inversion_method: str = "numerical",
+        *,
+        seed: int | None = None,
+        cov: np.ndarray | None = None,
     ) -> dict:
         """
         Análisis de incertidumbre mediante simulación Monte Carlo.
@@ -260,10 +281,20 @@ class UncertaintyPropagator:
             mv_true, rms_true, theta_true, polarization
         )
 
-        # Generar perturbaciones
-        sigma0_samples = sigma0_true + np.random.normal(0, sigma_sensor, n_samples)
-        rms_samples = rms_true + np.random.normal(0, sigma_rms, n_samples)
-        theta_samples = theta_true + np.random.normal(0, sigma_theta, n_samples)
+        rng = np.random.default_rng(seed)
+        # Generar perturbaciones (independientes o con covarianza 3x3)
+        if cov is not None:
+            cov = np.asarray(cov, dtype=float)
+            if cov.shape != (3, 3):
+                raise ValueError("cov debe ser 3x3 en orden [sigma0, rms, theta].")
+            eps = rng.multivariate_normal(mean=[0.0, 0.0, 0.0], cov=cov, size=n_samples)
+            sigma0_samples = sigma0_true + eps[:, 0]
+            rms_samples    = rms_true    + eps[:, 1]
+            theta_samples  = theta_true  + eps[:, 2]
+        else:
+            sigma0_samples = sigma0_true + rng.normal(0.0, sigma_sensor, n_samples)
+            rms_samples    = rms_true    + rng.normal(0.0, sigma_rms,    n_samples)
+            theta_samples  = theta_true  + rng.normal(0.0, sigma_theta,  n_samples)
 
         # Clip a rangos físicos
         rms_samples = np.clip(
@@ -279,7 +310,8 @@ class UncertaintyPropagator:
         print(f"\nEjecutando Monte Carlo ({n_samples} muestras)...")
 
         for i in range(n_samples):
-            if (i + 1) % (n_samples // 10) == 0:
+            step = max(1, n_samples // 10)
+            if (i + 1) % step == 0:
                 print(f"  Progreso: {(i + 1) / n_samples * 100:.0f}%")
 
             mv_samples[i] = self._invert_sigma0(
@@ -288,6 +320,7 @@ class UncertaintyPropagator:
                 theta=theta_samples[i],
                 polarization=polarization,
                 method=inversion_method,
+                sigma_sensor=sigma_sensor,
             )
 
         # Filtrar inversiones fallidas (NaN)
@@ -346,6 +379,9 @@ class UncertaintyPropagator:
         polarization: str = "VV",
         method: str = "numerical",
         mv_range: tuple = (VALID_DOMAIN.MV_MIN, VALID_DOMAIN.MV_MAX),
+        *,
+        sigma_sensor: float | None = None,
+        residual_tol_db: float | None = None,
     ) -> float:
         """
         Invierte σ⁰ observado para encontrar mv.
@@ -377,8 +413,15 @@ class UncertaintyPropagator:
 
             if result.success:
                 # Verificar que el error residual sea razonable
-                residual = np.sqrt(result.fun)
-                if residual < 5.0:  # Error < 5 dB (tolerancia amplia)
+                residual = float(np.sqrt(result.fun))
+                # Tolerancia: max(3 dB, 2*sigma_sensor) si no se pasa explícito
+                tol = residual_tol_db
+                if tol is None:
+                    if sigma_sensor is not None:
+                        tol = max(3.0, 2.0 * float(sigma_sensor))
+                    else:
+                        tol = 3.0
+                if residual < tol:
                     return result.x
 
             return np.nan
@@ -456,15 +499,17 @@ class UncertaintyPropagator:
                     QUALITY_FLAG[i, j] = 0
 
                 computed += 1
-                if computed % (total_points // 20) == 0:
+                step = max(1, total_points // 20)
+                if computed % step == 0:
                     print(f"  Progreso: {computed / total_points * 100:.0f}%")
 
         # Estadísticas
         valid_mask = ~np.isnan(UNCERTAINTY)
-        high_quality_fraction = np.sum(QUALITY_FLAG == 3) / valid_mask.sum()
-        medium_quality_fraction = np.sum(QUALITY_FLAG == 2) / valid_mask.sum()
-        low_quality_fraction = np.sum(QUALITY_FLAG == 1) / valid_mask.sum()
-        poor_quality_fraction = np.sum(QUALITY_FLAG == 0) / valid_mask.sum()
+        denom = max(1, int(valid_mask.sum()))
+        high_quality_fraction = np.sum(QUALITY_FLAG == 3) / denom
+        medium_quality_fraction = np.sum(QUALITY_FLAG == 2) / denom
+        low_quality_fraction = np.sum(QUALITY_FLAG == 1) / denom
+        poor_quality_fraction = np.sum(QUALITY_FLAG == 0) / denom
 
         # Visualización
         fig, axes = plt.subplots(1, 2, figsize=PLOT.FIGSIZE_DOUBLE)
@@ -546,7 +591,7 @@ class UncertaintyPropagator:
         plt.savefig(output_path, dpi=PLOT.DPI, bbox_inches="tight")
         plt.close()
 
-        print(f"\n✅ Mapa de calidad guardado: {output_path}")
+        print(f"\n Mapa de calidad guardado: {output_path}")
         print(f"\nDistribución de calidad:")
         print(f"  Alta:       {high_quality_fraction * 100:.1f}%")
         print(f"  Media:      {medium_quality_fraction * 100:.1f}%")
@@ -652,16 +697,16 @@ def run_comprehensive_uncertainty_analysis(output_dir: str = "analysis/outputs")
 
         # Comparación
         diff_std = abs(analytical["mv_uncertainty"] - mc["mv_std"])
-        agreement = diff_std / mc["mv_std"] * 100
+        rel_diff_pct = diff_std / max(1e-12, mc["mv_std"]) * 100
 
         print(f"\n  Acuerdo analítico vs. MC:")
-        print(f"    Diferencia en σ_mv: {diff_std:.3f}% ({agreement:.1f}% relativo)")
-        if agreement < 10:
-            print(f"    ✅ Excelente acuerdo (<10%)")
-        elif agreement < 20:
-            print(f"    ✓ Buen acuerdo (<20%)")
+        print(f"    Δσ_mv = {diff_std:.3f} puntos de %  ({rel_diff_pct:.1f}% relativo)")
+        if rel_diff_pct < 10:
+            print(f"     Excelente acuerdo (<10%)")
+        elif rel_diff_pct < 20:
+            print(f"     Buen acuerdo (<20%)")
         else:
-            print(f"    ⚠️  Discrepancia significativa (>{agreement:.0f}%)")
+            print(f"     Discrepancia significativa (>{rel_diff_pct:.0f}%)")
 
     # 3. Mapas de calidad predicha
     print("\n[2/3] Generando mapas de calidad predicha...")
@@ -740,7 +785,7 @@ def run_comprehensive_uncertainty_analysis(output_dir: str = "analysis/outputs")
     print(f"\nResultados en: {output_dir}/")
     print("  • quality_map_predicted_theta35.png")
     print("  • uncertainty_vs_angle.png")
-    print("\n📊 INNOVACIÓN CLAVE (O2):")
+    print("\n SE OBTIENE:")
     print("   Predicción de calidad SIN validación in situ mediante")
     print("   análisis de sensibilidad del modelo físico solamente.\n")
 
@@ -765,7 +810,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Propagación de incertidumbres IEM-B (INNOVACIÓN O2)"
+        description="Propagación de incertidumbres IEM-B"
     )
     parser.add_argument(
         "--output_dir",
@@ -781,7 +826,7 @@ if __name__ == "__main__":
         help="Modo de análisis",
     )
     parser.add_argument(
-        "--n_mc", type=int, default=10000, help="Número de muestras Monte Carlo"
+        "--seed", type=int, default=None, help="Semilla RNG para Monte Carlo"
     )
 
     args = parser.parse_args()
@@ -804,7 +849,11 @@ if __name__ == "__main__":
         # Solo Monte Carlo
         propagator = UncertaintyPropagator()
         result = propagator.monte_carlo_uncertainty(
-            mv_true=25.0, rms_true=1.5, theta_true=35.0, n_samples=args.n_mc
+            mv_true=25.0,
+            rms_true=1.5,
+            theta_true=35.0,
+            n_samples=args.n_mc,
+            seed=args.seed,
         )
         if result["status"] == "success":
             print("\nResultado Monte Carlo:")
@@ -821,4 +870,4 @@ if __name__ == "__main__":
             f"\nMapa guardado. Alta calidad: {quality_map['statistics']['high_quality_fraction'] * 100:.1f}%"
         )
 
-    print("\n✅ ANÁLISIS COMPLETADO\n")
+    print("\n ANÁLISIS COMPLETADO\n")
