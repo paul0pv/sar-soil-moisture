@@ -1,5 +1,8 @@
 import numpy as np
-from core.models import IEM_Model
+try:
+    from core.models import IEM_Model
+except Exception:
+    from models import IEM_Model
 
 
 def run_baghdadi_test():
@@ -34,7 +37,7 @@ def run_baghdadi_test():
     print("=" * 100)
 
     # ----------------------------------------------------------------------
-    # Test cases from Baghdadi (2011) Table 1, extended with an extrapolation case
+    # Test cases from Baghdadi (2011) Table 1, plus one extrapolation case
     # ----------------------------------------------------------------------
     cases = [
         {
@@ -46,6 +49,7 @@ def run_baghdadi_test():
             "clay_pct": 44.2,
             "sigma_expected_dB": -24.8,
             "desc": "Clay soil, medium moisture, low roughness",
+            "tol_db": 1.0,
         },
         {
             "id": "B12",
@@ -56,6 +60,7 @@ def run_baghdadi_test():
             "clay_pct": 44.2,
             "sigma_expected_dB": -23.5,
             "desc": "Clay soil, high moisture, moderate roughness",
+            "tol_db": 1.0,
         },
         {
             "id": "C08",
@@ -66,6 +71,7 @@ def run_baghdadi_test():
             "clay_pct": 44.2,
             "sigma_expected_dB": -25.2,
             "desc": "Clay soil, medium moisture, very low roughness",
+            "tol_db": 1.0,
         },
         {
             "id": "D15",
@@ -75,7 +81,8 @@ def run_baghdadi_test():
             "sand_pct": 25.0,
             "clay_pct": 35.0,
             "sigma_expected_dB": -22.0,  # extrapolated expected value
-            "desc": "Loam-clay soil, very high moisture",
+            "desc": "Loam-clay soil, very high moisture (extrapolated)",
+            "tol_db": 2.0,  # lax tolerance cause extrapolation
         },
     ]
 
@@ -83,7 +90,7 @@ def run_baghdadi_test():
     # Execution
     # ----------------------------------------------------------------------
     results = []
-    print("\nRunning IEM-B full chain simulations...\n")
+    print("\nRunning IEM-B full chain simulations (Gaussian spectrum)...\n")
 
     for test in cases:
         print("-" * 90)
@@ -97,7 +104,18 @@ def run_baghdadi_test():
         model = IEM_Model(
             sand_pct=test["sand_pct"],
             clay_pct=test["clay_pct"],
+            spectrum_mode="gaussian",
+            use_strict_fvv=False,
         )
+
+        k = model.k
+        s_m = test["rms_cm"] / 100.0
+        ks = k * s_m
+        Lopt_cm = model.roughness.compute_Lopt(test["rms_cm"], test["theta_deg"], "HV")
+        L_m = max(float(np.atleast_1d(Lopt_cm).reshape(-1)[0]) / 100.0, 1e-6)
+        print(f"kσ = {ks:.3f}  |  kL = {k*L_m:.3f}")
+        if ks >= 3.0:
+            print("  [WARN] kσ ≥ 3: fuera del dominio típico de validez de IEM-B para suelo.")
 
         # --- Compute cross-pol (HV) backscatter ---
         sigma_calc_dB = model.compute_backscatter(
@@ -106,6 +124,8 @@ def run_baghdadi_test():
             theta_deg=test["theta_deg"],
             polarization="HV",
         )
+        if isinstance(sigma_calc_dB, np.ndarray):
+            sigma_calc_dB = float(np.atleast_1d(sigma_calc_dB).reshape(-1)[0])
 
         sigma_exp_dB = test["sigma_expected_dB"]
         diff = sigma_calc_dB - sigma_exp_dB
@@ -115,7 +135,8 @@ def run_baghdadi_test():
         print(f"Expected σ⁰_HV (Baghdadi 2011): {sigma_exp_dB:.2f} dB")
         print(f"Δ = {diff:+.2f} dB (abs {abs_diff:.2f} dB)")
 
-        status = "✓ PASS" if abs_diff <= 1.0 else "✗ FAIL"
+        tol_db = test.get("tol_db", 1.0)
+        status = "✓ PASS" if abs_diff <= tol_db else "✗ FAIL"
         print(f"Result: {status}\n")
 
         results.append(
@@ -145,7 +166,7 @@ def run_baghdadi_test():
         )
     print("-" * 80)
 
-    abs_errors = np.array([r["abs_diff"] for r in results])
+    abs_errors = np.array([r["abs_diff"] for r in results], dtype=float)
     mae = np.mean(abs_errors)
     rmse = np.sqrt(np.mean(np.square(abs_errors)))
 
@@ -167,6 +188,18 @@ def run_baghdadi_test():
         print(" • Lopt calibration parameters (Eq. 3 Baghdadi 2011)")
         print(" • Cross-pol terms F_hv and f_hv in IEM series (Eq. 17–18 Fung 1992)")
     print("=" * 100)
+
+    try:
+        t0 = cases[0]
+        vv = model.compute_backscatter(
+            mv=t0["mv"], rms_cm=t0["rms_cm"], theta_deg=t0["theta_deg"], polarization="VV"
+        )
+        if isinstance(vv, np.ndarray):
+            vv = float(np.atleast_1d(vv).reshape(-1)[0])
+        print("\nSanity VV vs HV (case A11):")
+        print(f"  σ⁰_VV ≈ {vv:.2f} dB,  σ⁰_HV ≈ {results[0]['calc']:.2f} dB,  Δ(VV−HV) ≈ {vv - results[0]['calc']:.2f} dB")
+    except Exception as e:
+        print(f"[WARN] VV sanity check skipped: {e}")
 
 
 if __name__ == "__main__":
