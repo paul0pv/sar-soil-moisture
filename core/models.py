@@ -27,9 +27,12 @@ class DielectricModel:
             sand_pct: Porcentaje de arena (0-100)
             clay_pct: Porcentaje de arcilla (0-100)
         """
-        self.sand = sand_pct
-        self.clay = clay_pct
-        self.silt = 100.0 - sand_pct - clay_pct
+        s = float(sand_pct); c = float(clay_pct)
+        if s < 0 or c < 0 or s + c > 100:
+            raise ValueError("Textura inválida: arena>=0, arcilla>=0 y arena+arcilla<=100.")
+        self.sand = s
+        self.clay = c
+        self.silt = 100.0 - s - c
 
         # Coeficientes de regresión para Epsilon Prima (Parte Real) - Tabla IV
         # Estructura: coef = alpha + beta*f + gamma*f² (f en GHz)
@@ -90,10 +93,12 @@ class DielectricModel:
             Constante dieléctrica compleja ε_r = ε' + jε''
         """
         f_ghz = frequency / 1e9
-        mv = np.asarray(mv)
+        mv = np.asarray(mv, dtype=np.float64)
 
         # Normalizar a fracción (0-1)
         mv_frac = np.where(mv > 1.0, mv / 100.0, mv)
+        # Clipping razonable para evitar extrapolaciones extremas
+        mv_frac = np.clip(mv_frac, 0.0, 0.6)
 
         S, C = self.sand, self.clay
 
@@ -159,6 +164,9 @@ class SurfaceRoughness:
         Args:
             correlation: Tipo de función de autocorrelación ("gaussian")
         """
+        correlation = correlation.lower()
+        if correlation not in ("gaussian", "fractal"):
+            raise ValueError("correlation debe ser 'gaussian' o 'fractal'.")
         self.correlation_type = correlation
         self.t = 1.33
 
@@ -190,7 +198,7 @@ class SurfaceRoughness:
             Lopt en cm (mismo shape que los inputs)
         """
         rms_cm = np.asarray(rms_cm)
-        theta_rad = np.deg2rad(theta_deg)
+        theta_rad = np.deg2rad(theta_deg).astype(np.float64)
         theta_deg_arr = np.asarray(theta_deg)
 
         if polarization.upper() == "VV":
@@ -229,7 +237,7 @@ class SurfaceRoughness:
         else:
             raise NotImplementedError(f"Polarización {polarization} no soportada.")
 
-        return Lopt
+        return np.clip(Lopt, 1e-3, np.inf)
 
     def get_spectrum(self, k_x, L_m, n):
         """
@@ -309,7 +317,7 @@ class IEM_Model:
     - f_pp, F_pp: términos de reflexión (dependen de polarización)
     """
 
-    def __init__(self, frequency=5.405e9, sand_pct=20, clay_pct=30):
+    def __init__(self, frequency=5.405e9, sand_pct=20, clay_pct=30, *, spectrum_mode: str = "gaussian", max_terms: int = 10, use_strict_fvv: bool = False):
         """
         Inicializa el modelo IEM calibrado.
 
@@ -318,16 +326,17 @@ class IEM_Model:
             sand_pct: Porcentaje de arena (0-100)
             clay_pct: Porcentaje de arcilla (0-100)
         """
-        self.frequency = frequency
+        self.frequency = float(frequency)
         self.wavelength = 2.99792e8 / frequency  # λ = c/f
         self.k = 2.0 * np.pi / self.wavelength  # Número de onda (rad/m)
 
         # Submodelos
         self.dielectric = DielectricModel(sand_pct, clay_pct)
-        self.roughness = SurfaceRoughness(correlation="fractal")
+        self.roughness = SurfaceRoughness(correlation=spectrum_mode)
 
         # Número de términos en la serie de scattering
-        self.N_TERMS = 10
+        self.N_TERMS = int(max(1, max_terms))
+        self.use_strict_fvv = bool(use_strict_fvv)
 
     # --- COEFICIENTES DE FRESNEL ---
 
@@ -398,8 +407,13 @@ class IEM_Model:
         Returns:
             f_vv: Término de scattering de primer orden
         """
-        # Versión simplificada usada en muchas implementaciones IEM
-        return (1.0 + R_v) / 2.0
+        if self.use_strict_fvv:
+            # Protección ante cos(θ) pequeño
+            cost_safe = np.where(np.abs(cost) < 1e-6, 1e-6, cost)
+            return 2.0 * R_v / cost_safe
+        else:
+            # Versión simplificada usada en implementaciones IEM rápidas
+            return (1.0 + R_v) / 2.0
 
     def _F_vv(self, eps_r, sint, cost):
         """
@@ -541,9 +555,9 @@ class IEM_Model:
         - Hallikainen et al., IEEE TGRS, Vol. GE-23, No. 1, January 1985
         """
         # --- 1. VECTORIZACIÓN Y NORMALIZACIÓN ---
-        mv = np.asarray(mv)
-        rms_cm = np.asarray(rms_cm)
-        theta_rad = np.deg2rad(theta_deg)
+        mv = np.asarray(mv, dtype=np.float64)
+        rms_cm = np.asarray(rms_cm, dtype=np.float64)
+        theta_rad = np.deg2rad(theta_deg).astype(np.float64)
         polarization = polarization.upper()
 
         # --- 2. PARÁMETROS GEOMÉTRICOS ---
@@ -553,13 +567,13 @@ class IEM_Model:
         k_z = self.k * cost  # Componente vertical del número de onda
         k_x = self.k * sint  # Componente horizontal del número de onda
 
-        # ✅ CRÍTICO: Convertir rugosidad de cm a metros
-        s_m = rms_cm / 100.0
+        # Convertir rugosidad de cm a metros
+        s_m = np.clip(rms_cm, 0.0, np.inf) / 100.0
 
         # --- 3. CALIBRACIÓN BAGHDADI: Lopt ---
         # Usa ecuaciones DIFERENTES para VV y HV
         Lopt_cm = self.roughness.compute_Lopt(rms_cm, theta_deg, polarization)
-        L_m = Lopt_cm / 100.0  # Convertir a metros
+        L_m = np.clip(Lopt_cm, 1e-3, np.inf) / 100.0  # Convertir a metros
 
         # --- 4. MODELO DIELÉCTRICO HALLIKAINEN: ε_r ---
         eps_r = self.dielectric.compute_dielectric(mv, self.frequency)
@@ -587,7 +601,9 @@ class IEM_Model:
         # --- 7. SERIE DE SCATTERING (Fung 1992, Eq. 17) ---
 
         # Factor de atenuación exponencial
-        exp_term = np.exp(-2.0 * (k_z * s_m) ** 2)
+        kz_s = k_z * s_m
+        kz_s2 = np.clip(kz_s * kz_s, 0.0, 700.0)  # exp(-2*700) ~ 0 numéricamente
+        exp_term = np.exp(-2.0 * kz_s2)
 
         # Acumulador de la serie
         series_sum = np.zeros_like(R_h, dtype=complex)
@@ -598,14 +614,14 @@ class IEM_Model:
             # Espectro de potencia Gaussiano (Fung Eq. 4-A.3)
             Wn = self.roughness.get_spectrum(2.0 * k_x, L_m, n)
 
-            # ✅ ECUACIÓN (18) DE FUNG - CRÍTICO: Incluir s_m
+            # ECUACIÓN (18) DE FUNG
             # I_pp^(n) = (2·k_z·s)^n × f + (k_z·s)^(2n)/2 × F
             #
-            # NOTA: NO se usa √n_fact (causa sobre-atenuación ~35 dB)
+            # NO se usa √n_fact (causa sobre-atenuación ~35 dB)
             # La normalización 1/n! en la serie es suficiente
-            I_pp_n = ((2.0 * k_z * s_m) ** n) * f_term + (
-                (k_z * s_m) ** (2 * n) / 2.0
-            ) * F_term
+            p1 = np.power(2.0 * kz_s, n, dtype=np.float64)
+            p2 = np.power(kz_s, 2 * n, dtype=np.float64)
+            I_pp_n = p1 * f_term + 0.5 * p2 * F_term
 
             # Acumulación de la serie (Eq. 17)
             # Σ[(W^(n)/n!) × |I_pp^(n)|²]
@@ -616,7 +632,7 @@ class IEM_Model:
         sigma0_lin = (self.k**2 / 2.0) * exp_term * np.real(series_sum)
 
         # Protección contra valores no físicos (log de negativos o cero)
-        sigma0_lin = np.where(sigma0_lin <= 1e-15, 1e-15, sigma0_lin)
+        sigma0_lin =  np.where(~np.isfinite(sigma0_lin) | (sigma0_lin <= 1e-20), 1e-20, sigma0_lin)
 
         # Convertir a dB
         sigma0_dB = 10.0 * np.log10(sigma0_lin)
