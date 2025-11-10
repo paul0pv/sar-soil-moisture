@@ -1,7 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import factorial
-from core.models import IEM_Model, SurfaceRoughness
+try:
+    from core.models import IEM_Model, SurfaceRoughness
+except Exception:
+    from models import IEM_Model, SurfaceRoughness
 
 
 def run_fung_test():
@@ -39,7 +42,7 @@ def run_fung_test():
     k_z = k * cost
     k_x = k * sint
 
-    roughness = SurfaceRoughness()
+    roughness = SurfaceRoughness(correlation="gaussian")
 
     # -----------------------
     # PART A — HV (cross-pol)
@@ -64,8 +67,8 @@ def run_fung_test():
     for n in range(1, model_shell.N_TERMS + 1):
         n_fact = float(factorial(n))
         Wn = roughness.get_spectrum(2.0 * k_x, L_m, n)
-        I_n = (2.0 * k_z) ** n * f_hv + 0.5 * (k_z ** (2 * n)) * F_hv
-        term_n = (s_m ** (2 * n) / n_fact) * (np.abs(I_n) ** 2) * Wn
+        I_n = (2.0 * k_z * s_m) ** n * f_hv + 0.5 * (k_z * s_m) ** (2 * n) * F_hv
+        term_n = (np.abs(I_n) ** 2) * (Wn / n_fact)
         series_sum_hv += np.real(term_n)
 
     sigma0_lin_hv = 0.5 * (k**2) * exp_term * series_sum_hv
@@ -191,9 +194,14 @@ def run_fung_test():
     print(
         f"VV RMSE vs ref: {rmse_vv:.3f} dB  | VV monotonic: {monotonic_vv} | VV range_ok: {range_ok_vv}"
     )
-    final_pass = (monotonic_hv and range_ok_hv and (rmse_hv < 3.0)) and (
-        monotonic_vv and range_ok_vv and (rmse_vv < 3.0)
-    )
+    # Veredicto: tolerancia amplia porque las referencias VV son aproximadas (lectura de figura)
+    final_pass = (monotonic_hv and range_ok_hv and (rmse_hv < 3.0)) and \
+                 (monotonic_vv and range_ok_vv and (rmse_vv < 3.0))
+
+    # Información adicional de dominio y convergencia
+    print("\nConvergence info:")
+    print(f"  N_TERMS used = {model_shell.N_TERMS}")
+    print(f"  k*s = {ks:.3f} ; k*L = {kl:.3f}")
     print(f"\nFinal overall verdict: {'PASS' if final_pass else 'FAIL'}")
     print("=" * 80)
 
