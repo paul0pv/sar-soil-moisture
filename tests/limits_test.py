@@ -1,7 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import factorial
-from core.models import IEM_Model, SurfaceRoughness
+try:
+    from core.models import IEM_Model, SurfaceRoughness
+except Exception:
+    from models import IEM_Model, SurfaceRoughness
 
 
 def run_limits_test():
@@ -22,7 +25,7 @@ def run_limits_test():
     sint, cost = np.sin(theta_rad), np.cos(theta_rad)
     k_z, k_x = k * cost, k * sint
 
-    roughness = SurfaceRoughness()
+    roughness = SurfaceRoughness(correlation="gaussian")
     eps_r = complex(15.0, 0.0)
     R_v = model._fresnel_v(eps_r, theta_rad)
     f_vv = model._f_vv(eps_r, sint, cost, R_v)
@@ -38,12 +41,12 @@ def run_limits_test():
         for n in range(1, model.N_TERMS + 1):
             n_fact = float(factorial(n))
             Wn = roughness.get_spectrum(2 * k_x, L_m, n)
-            I_n = (2 * k_z) ** n * f_vv + 0.5 * (k_z ** (2 * n)) * F_vv
-            term_n = (np.abs(I_n) ** 2) * Wn / n_fact
+            I_n = (2.0 * k_z * s_m) ** n * f_vv + 0.5 * (k_z * s_m) ** (2 * n) * F_vv
+            term_n = (np.abs(I_n) ** 2) * (Wn / n_fact)
             series_sum += np.real(term_n)
 
-        sigma0_lin = (k**2 / (2 * np.pi)) * (cost**2) * exp_term * series_sum
-        sigma0_lin = np.clip(np.real(sigma0_lin), 1e-15, None)
+        sigma0_lin = 0.5 * (k**2) * exp_term * series_sum
+        sigma0_lin = np.clip(np.real(sigma0_lin), 1e-20, None)
         sigma0_dB = 10 * np.log10(sigma0_lin)
 
         plt.plot(theta_deg, sigma0_dB, lw=2, label=f"k*s = {ks}")
@@ -86,6 +89,14 @@ def run_limits_test():
     plt.legend()
     plt.savefig("validation_test3_limits_moisture.png", dpi=150, bbox_inches="tight")
     print("Saved validation_test3_limits_moisture.png")
+
+    print("\nDomain report:")
+    for ks in ks_values:
+        s_m = ks / k
+        L_m = kl / k
+        print(f"  ks = {ks:.2f}  |  k*s = {k*s_m:.2f}  |  k*L = {k*L_m:.2f}")
+        if ks >= 3.0:
+            print("   [WARN] k*s ≥ 3: fuera del dominio típico de validez del IEM.")
 
     print("\nPhysical expectations:")
     print(" • Increasing ks → higher σ⁰ (rougher surface stronger return)")
