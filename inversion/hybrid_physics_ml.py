@@ -49,6 +49,10 @@ class PhysicsGuidedNN(nn.Module):
         hidden_sizes: list = [32, 32],
         physical_model: IEM_Model = None,
         use_physical_residuals: bool = True,
+        anchor_mv: float = 25.0,
+        anchor_rms: float = 1.5,
+        anchor_theta: float = 35.0,
+        fd_step: float = 1e-2,
     ):
         """
         Args:
@@ -73,14 +77,33 @@ class PhysicsGuidedNN(nn.Module):
             layers.append(nn.Dropout(0.2))
             in_features = hidden_size
 
-        # Capa de salida: [mv, rms] (opcional)
+        # Capa de salida: [mv, rms]
         layers.append(nn.Linear(in_features, 2))
 
         self.network = nn.Sequential(*layers)
 
-        # Parámetros aprendibles para fusión física-ML
-        self.alpha = nn.Parameter(torch.tensor(0.5))  # Peso de componente física
-        self.beta = nn.Parameter(torch.tensor(0.5))  # Peso de componente ML
+        # Mezcla convexa: w in (0,1). Output = w*physics + (1-w)*ML
+        self.alpha = nn.Parameter(torch.tensor(0.0))  # logit inicial ~ w=0.5
+
+        # === Coeficientes de sensibilidad física (linealización de IEM) ===
+        # σ0 ≈ a*mv + b*rms + c*theta + d  (d en torno a ancla)
+        # Se calculan una vez con diferencias centrales.
+        mv0, r0, th0 = anchor_mv, anchor_rms, anchor_theta
+        h = fd_step
+        # Valores base
+        s00 = self.physical_model.compute_backscatter(mv0, r0, th0, "VV")
+        # Derivadas numéricas (unidades coherentes con IEM en dB, mv en %, rms en cm, theta en grados)
+        a = (self.physical_model.compute_backscatter(mv0 + h, r0, th0, "VV")
+             - self.physical_model.compute_backscatter(mv0 - h, r0, th0, "VV")) / (2*h)
+        b = (self.physical_model.compute_backscatter(mv0, r0 + h, th0, "VV")
+             - self.physical_model.compute_backscatter(mv0, r0 - h, th0, "VV")) / (2*h)
+        c = (self.physical_model.compute_backscatter(mv0, r0, th0 + h, "VV")
+             - self.physical_model.compute_backscatter(mv0, r0, th0 - h, "VV")) / (2*h)
+        # Guardar como buffers para usarlos en autograd (constantes)
+        self.register_buffer("phys_a", torch.tensor(float(a)))
+        self.register_buffer("phys_b", torch.tensor(float(b)))
+        self.register_buffer("phys_c", torch.tensor(float(c)))
+        self.register_buffer("phys_d0", torch.tensor(float(s00 - a*mv0 - b*r0 - c*th0)))
 
     def forward(self, x, rms_prior=None):
         """
@@ -99,32 +122,20 @@ class PhysicsGuidedNN(nn.Module):
         if not self.use_physical_residuals:
             return ml_prediction
 
-        # Componente física: Estimación inicial usando modelo físico
-        # (En práctica, esto requeriría inversión del IEM en GPU,
-        #  aquí usamos una aproximación lineal simple como demo)
-
-        # Aproximación lineal del IEM basada en sensibilidad promedio
-        # ∂σ⁰/∂mv ≈ 0.5 dB/% (típico en rango 20-30% mv)
+        # Componente física: inversor lineal aproximado usando sensibilidad a mv.
+        # σ0 ≈ a*mv + b*rms + c*theta + d  =>  mv ≈ (σ0 - b*rms - c*theta - d)/a
         sigma0_vv = x[:, 0]
         theta = x[:, 2] if x.shape[1] > 2 else torch.full_like(sigma0_vv, 35.0)
+        if rms_prior is None:
+            rms_prior = torch.full_like(sigma0_vv, 1.5)
+        mv_phys = (sigma0_vv - self.phys_b * rms_prior - self.phys_c * theta - self.phys_d0) / (self.phys_a + 1e-8)
+        mv_phys = torch.clamp(mv_phys, VALID_DOMAIN.MV_MIN, VALID_DOMAIN.MV_MAX)
+        rms_phys = rms_prior
+        physics_prediction = torch.stack([mv_phys, rms_phys], dim=1)
 
-        # Estimación física aproximada (placeholder)
-        # En implementación real, usar lookup table o aproximación polinomial
-        mv_physics = (sigma0_vv + 25.0) / 0.5  # Conversión lineal simplificada
-        mv_physics = torch.clamp(mv_physics, VALID_DOMAIN.MV_MIN, VALID_DOMAIN.MV_MAX)
-
-        if rms_prior is not None:
-            rms_physics = rms_prior
-        else:
-            rms_physics = torch.full_like(mv_physics, 1.5)  # Valor por defecto
-
-        physics_prediction = torch.stack([mv_physics, rms_physics], dim=1)
-
-        # Fusión adaptativa: α*física + β*ML
-        alpha_norm = torch.sigmoid(self.alpha)
-        beta_norm = torch.sigmoid(self.beta)
-
-        combined = alpha_norm * physics_prediction + beta_norm * ml_prediction
+        # Mezcla convexa: w \in (0,1)
+        w = torch.sigmoid(self.alpha)
+        combined = w * physics_prediction + (1.0 - w) * ml_prediction
 
         return combined
 
@@ -153,32 +164,14 @@ class PhysicsGuidedNN(nn.Module):
         # 1. Loss de datos (MSE estándar)
         data_loss = nn.MSELoss()(predictions, targets)
 
-        # 2. Penalización de consistencia física (forward)
-        # Recalcular σ⁰ usando predicciones y comparar con observado
-        mv_pred = predictions[:, 0].detach().cpu().numpy()
-        rms_pred = predictions[:, 1].detach().cpu().numpy()
-        theta_np = theta_inputs.detach().cpu().numpy()
-        sigma0_obs = sigma0_inputs.detach().cpu().numpy()
-
-        # Calcular σ⁰ predicho usando IEM (en CPU, batch)
-        sigma0_pred = np.zeros_like(mv_pred)
-        for i in range(len(mv_pred)):
-            try:
-                sigma0_pred[i] = self.physical_model.compute_backscatter(
-                    mv_pred[i], rms_pred[i], theta_np[i], "VV"
-                )
-            except:
-                sigma0_pred[i] = sigma0_obs[i]  # Fallback
-
-        # Penalización si σ⁰_pred != σ⁰_obs
-        sigma0_pred_tensor = (
-            torch.from_numpy(sigma0_pred).float().to(predictions.device)
-        )
-        sigma0_obs_tensor = sigma0_inputs.squeeze()
-
-        physics_consistency_loss = torch.mean(
-            (sigma0_pred_tensor - sigma0_obs_tensor) ** 2
-        )
+        # 2. Penalización de consistencia física diferenciable usando la linealización:
+        # σ0_lin(pred) = a*mv_pred + b*rms_pred + c*theta + d
+        mv_pred  = predictions[:, 0]
+        rms_pred = predictions[:, 1]
+        theta    = theta_inputs.squeeze()
+        sigma0_lin = self.phys_a * mv_pred + self.phys_b * rms_pred + self.phys_c * theta + self.phys_d0
+        sigma0_obs = sigma0_inputs.squeeze()
+        physics_consistency_loss = torch.mean((sigma0_lin - sigma0_obs) ** 2)
 
         # 3. Penalización de rangos físicos
         mv_out_of_range = torch.relu(
@@ -223,21 +216,21 @@ class SARInversionDataset(Dataset):
         # Pivotar polarizaciones a columnas si es necesario
         if "polarization" in df.columns:
             df_pivot = df.pivot_table(
-                index=["sample_id", "mv", "rms", "theta"],
+                index=[c for c in ["sample_id", "mv", "rms", "theta"] if c in df.columns],
                 columns="polarization",
                 values="sigma0_dB",
                 aggfunc="first",
             ).reset_index()
 
             # Renombrar columnas
-            df_pivot.columns = [
-                "sample_id",
-                "mv",
-                "rms",
-                "theta",
-                "sigma0_HV",
-                "sigma0_VV",
-            ]
+            cols = list(df_pivot.columns)
+            # Asegurar orden: [mv, rms, theta, sigma0_HV, sigma0_VV] (+sample_id si existe)
+            rename_map = {}
+            if "sigma0_HV" not in cols and "HV" in cols:
+                rename_map["HV"] = "sigma0_HV"
+            if "sigma0_VV" not in cols and "VV" in cols:
+                rename_map["VV"] = "sigma0_VV"
+            df_pivot = df_pivot.rename(columns=rename_map)
             df = df_pivot
 
         self.X = df[features].values.astype(np.float32)
@@ -293,6 +286,9 @@ def train_physics_guided_model(
     # Inicializar modelo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}")
+    # Semillas básicas
+    np.random.seed(42); random.seed(42); torch.manual_seed(42); torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
 
     model = PhysicsGuidedNN(
         n_inputs=len(features), hidden_sizes=[32, 32], use_physical_residuals=True
@@ -384,7 +380,7 @@ def train_physics_guided_model(
                 f"{output_dir}/best_physics_guided_model.pth",
             )
 
-    print(f"\n✅ Entrenamiento completado")
+    print(f"\n Entrenamiento completado")
     print(f"   Mejor val loss: {best_val_loss:.4f}")
     print(f"   Modelo guardado: {output_dir}/best_physics_guided_model.pth")
 
@@ -431,7 +427,7 @@ if __name__ == "__main__":
 
     # Verificar que existan los datasets
     if not Path(args.train_csv).exists():
-        print(f"\n❌ ERROR: No se encontró {args.train_csv}")
+        print(f"\n ERROR: No se encontró {args.train_csv}")
         print("   Ejecute primero: python data/generate_dataset.py")
         sys.exit(1)
 
@@ -444,7 +440,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
     )
 
-    print("\n✅ MODELO HÍBRIDO FÍSICA-ML ENTRENADO")
-    print("\n📊 CONTRIBUCIÓN:")
+    print("\n MODELO HÍBRIDO FÍSICA-ML ENTRENADO")
+    print("\n CONTRIBUCIÓN:")
     print("   Integra conocimiento físico del IEM-B con capacidad de")
     print("   aprendizaje de redes neuronales (Estado del Arte 2025).\n")
