@@ -1,96 +1,275 @@
-`README.md`
+# IEM-C: Simulación e Inversión de Humedad del Suelo en Banda C mediante Modelado Físico y Aprendizaje Híbrido
 
-# Implementación del Modelo Físico IEM-B para Simulación SAR
+## Propósito
 
-Este documento describe la arquitectura y la lógica de implementación del archivo `models.py`, un motor de simulación física diseñado para generar datos de retrodispersión de radar (SAR).
+Repositorio para simulación e inversión de humedad del suelo en banda C usando:
 
-## 1. Objetivo del Proyecto (Metas)
+1. Modelo físico IEM-B calibrado con Hallikainen (dieléctrico) y Baghdadi (Lopt).
+2. Validación física y numérica con tests unitarios orientados a papers.
+3. Inversión con redes neuronales y modelo híbrido Física+ML con pérdida guiada por física.
+4. Propagación de incertidumbres analítica y Monte Carlo.
 
-El objetivo principal de este código es servir como el "motor" para generar un **conjunto de datos sintético a gran escala**.
+El objetivo es reproducible: generar datasets sintéticos, entrenar inversores, estimar incertidumbre y validar resultados frente a literatura (Fung 1992; Baghdadi 2011).
 
-Este conjunto de datos es la piedra angular de un estudio de aprendizaje automático (Machine Learning) cuyo fin es **invertir la señal de radar de la Banda C (ej. Sentinel-1)** para estimar la **humedad volumétrica del suelo ($M_v$)**, corrigiendo al mismo tiempo el efecto de la **rugosidad superficial ($H_{rms}$)**.
+---
 
-## 2. Arquitectura de Modelos Integrados (Integración)
+## Estructura
 
-La implementación está contenida en `models.py` y sigue una cadena de física modular. El cálculo de la retrodispersión ($\sigma^0$) se basa en tres modelos científicos fundamentales que se integran de la siguiente manera:
+```
+├── analysis
+│   ├── ambiguity_mapper.py          # mapas de ambigüedad y regiones mal condicionadas
+│   ├── response_surfaces.py         # superficies σ⁰=f(mv, s, θ)
+│   ├── sensitivity_analysis.py      # ∂σ⁰/∂mv, ∂σ⁰/∂s, ∂σ⁰/∂θ
+├── core
+│   ├── constants.py                 # dominios válidos, banderas de calidad, tamaños de figuras, etc.
+│   ├── models.py                    # DielectricModel (Hallikainen), SurfaceRoughness (Baghdadi/Fung), IEM_Model
+│   ├── utils.py                     # métricas (RMSE, MAE, sesgo), utilitarios numéricos
+├── data
+│   ├── generate_dataset.py          # generación de dataset sintético σ⁰ con variantes VV/HV
+├── inversion
+│   ├── hybrid_physics_ml.py         # red guiada por física con pérdida de consistencia forward
+│   ├── neural_network.py            # RN simple para inversión σ⁰→mv (y opcional rms)
+│   ├── uncertainty_propagation.py   # O2: propagación analítica y Monte Carlo; mapa de calidad sin validación in situ
+├── tests
+│   ├── baghdadi_test.py             # validación HV vs Baghdadi 2011 (tabla de referencia)
+│   ├── fung_test.py                 # validación “white-box” HV/VV vs Fung 1992 (serie y tendencias)
+│   ├── limits_test.py               # límites físicos: ks, kL y dependencia angular
+│   ├── monotonicity_test.py         # monotonía σ⁰_HV vs mv en escenarios de θ y s
+├── validation
+│   ├── sentinel1_validation.py      # esqueleto para validación con Sentinel-1 (si se dispone de datos)
+├── requirements.txt
+├── run_full_pipeline.sh             # atajo para pipeline completo en Linux/macOS
+├── setup.sh / setup.bat             # entorno local (venv) en Linux/macOS o Windows
+```
 
-1.  **Entrada del Usuario:** El modelo principal (`IEM_Model.compute_backscatter`) recibe los parámetros físicos:
-    * Humedad del Suelo (`mv` en %)
-    * Rugosidad RMS (`rms_cm` en cm)
-    * Ángulo de Incidencia (`theta_deg` en grados)
+---
 
-2.  **Paso 1: Modelo Dieléctrico (Hallikainen 1985):** La `mv` (junto con la textura del suelo definida en `__init__`) se pasa al `DielectricModel` para calcular la constante dieléctrica compleja del suelo ($\epsilon_r$).
+## Requisitos
 
-3.  **Paso 2: Calibración de Rugosidad (Baghdadi 2011):** Los `rms_cm` y `theta_deg` se pasan al `SurfaceRoughness.compute_Lopt` para calcular la longitud de correlación óptima (`Lopt`), que es la calibración clave del "IEM-B".
+* Python ≥ 3.10
+* Paquetes ver `requirements.txt`
+* CPU con BLAS; GPU opcional para PyTorch
+* Espacio en disco para datasets sintéticos (∼100–500 MB según configuración)
 
-4.  **Paso 3: Modelo de Dispersión (Fung 1992):** Los valores $\epsilon_r$ (del Paso 1) y `Lopt` (del Paso 2), junto con `rms_cm` y `theta_deg`, se introducen en las ecuaciones físicas del Modelo de Ecuación Integral (IEM) para calcular el coeficiente de retrodispersión final, $\sigma^0$ (en dB).
+Instalación rápida (Linux/macOS):
 
-## 3. Desglose de Componentes y Fuentes (Documentos Base)
+```bash
+chmod +x setup.sh
+./setup.sh
+# o manual:
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
 
-La implementación debe ser una transcripción precisa de las siguientes ecuaciones de la literatura:
+Windows (PowerShell):
 
-### 3.1. `DielectricModel`
+```powershell
+.\setup.bat
+# o manual
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -U pip
+pip install -r requirements.txt
+```
 
-* **Fuente:** Hallikainen et al. (1985), "Microwave Dielectric Behavior of Wet Soil-Part 1", IEEE TGRS.
-* **Lógica de Implementación:**
-    * Se implementan las **Ecuaciones (1) y (2)**, que son regresiones polinómicas (en frecuencia) basadas en las **Tablas IV y V** para encontrar los coeficientes texturales (`A, B, C` y `D, E, F`).
-    * Estos coeficientes se utilizan en las **Ecuaciones (3) y (4)** para calcular la parte real ($\epsilon'$) y la parte imaginaria ($\epsilon''$) de la constante dieléctrica a partir de la humedad `mv`.
-    * La función `compute_dielectric` debe estar vectorizada para `mv`.
+---
 
-### 3.2. `SurfaceRoughness`
+## Flujo de trabajo (pipeline)
 
-Esta clase implementa dos funciones de dos artículos diferentes:
+### 1) Generación del dataset sintético
 
-1.  **`compute_Lopt`**
-    * **Fuente:** Baghdadi et al. (2011), "Semiempirical Calibration of the IEM... in C-Band".
-    * **Lógica de Implementación:** Implementa la **Ecuación (3)** para `Lopt` en polarización VV. Esta calibración es lo que define al modelo como "IEM-B" y relaciona `Lopt` con `H_{rms}` y `theta`.
+```bash
+# variables por defecto en data/generate_dataset.py (frecuencia, rejillas de mv/s/θ, etc.)
+python -m data.generate_dataset
+# salida típica: data/synthetic_dataset_100k.csv
+```
 
-2.  **`get_spectrum`**
-    * **Fuente:** Fung et al. (1992), "Backscattering from a Randomly Rough Dielectric Surface".
-    * **Lógica de Implementación:** Implementa el espectro de potencia Gaussiano, **Ecuación (4-A.3)**.
-    * La fórmula es: $W^{(n)}(k_x) = \frac{L_m^2}{2n} \exp\left(-\frac{k_x^2 L_m^2}{4n}\right)$.
-    * **Punto Crítico:** El factor de `/ (4 * n)` en el exponente es fundamental y una fuente común de error.
+### 2) Exploración física básica
 
-### 3.3. `IEM_Model`
+```bash
+# superficies de respuesta, análisis de sensibilidad
+python -m analysis.response_surfaces
+python -m analysis.sensitivity_analysis
+python -m analysis.ambiguity_mapper
+```
 
-Esta es la clase principal que implementa la física del IEM.
+### 3) Inversión con redes
 
-* **Fuente:** Fung et al. (1992), "Backscattering from a Randomly Rough Dielectric Surface".
-* **Lógica de Implementación de `compute_backscatter`:**
-    1.  **Términos de Fresnel:** Se calculan los términos $R_{vv}$ (Fresnel), $f_{vv}$ (**Eq. 22**) y $F_{vv}$ (**Eq. 24**). Estos términos contienen toda la dependencia dieléctrica ($\epsilon_r$).
-    2.  **Cálculo de la Serie (Eq. 17 y 18):** El modelo calcula el término complementario (incoherente) $\sigma^c_{pp}$ (Eq. 17), ya que el término de Kirchhoff (coherente) se omite para superficies agrícolas.
-    3.  La **Ecuación (17)** es la suma principal:
-        $\sigma^c_{pp} = \frac{k^2}{2} e^{-2k_z^2s^2} \sum_{n=1}^{\infty} \frac{s_m^{2n}}{n!} |I_{pp}^{(n)}|^2 W^{(n)}$
-    4.  **Lógica del Bucle (Implementación Correcta):** El código debe iterar de `n=1` a `N_TERMS` y, en cada paso:
-        * Calcular el término de campo $I_{vv}^{(n)}$ usando la **Ecuación (18)**. Esta ecuación **NO** depende de $s_m$:
-            $I_{vv}^{(n)} = (2k_z)^n f_{vv} + \frac{(k_z)^{2n}}{2} F_{vv}$
-        * Calcular el espectro $W^{(n)}$ (usando `get_spectrum`).
-        * Combinar los términos de la suma de Eq. (17):
-            `term_n = ( (s_m**(2*n)) / n_fact ) * np.abs(I_vv_n)**2 * Wn`
-    5.  **Resultado Final:** La suma de `term_n` se multiplica por los pre-factores de Eq. (17):
-        `sigma0_C = (self.k**2 / 2) * exp_term * series_sum`
-    6.  **Punto Crítico:** El pre-factor es $\frac{k^2}{2}$ (Ecuación 17). Errores comunes (como $\frac{k^2}{4\pi}$) introducen un sesgo de ~8 dB.
-    7.  Finalmente, se convierte a decibelios (dB), manejando `log(0)`.
+**Red simple (supervisada):**
 
-## 4. Proceso de Validación y Estudio Previo
+```bash
+python -m inversion.neural_network \
+  --dataset_path data/synthetic_dataset_100k.csv \
+  --epochs 100
+# genera trained_model_<escenario>.pth e inversion_comparison.png
+```
 
-Por lo tanto, este `models.py` ha sido diseñado para pasar rigurosamente 4 scripts de prueba:
+**Modelo híbrido Física+ML:**
 
-1.  **`fung_test.py`:** Valida la física pura del *scattering* (Eq. 17 y 18) contra la Figura 2 del paper de Fung (1992).
-2.  **`baghdadi_test.py`:** Valida la **cadena de integración completa** (Hallikainen + Lopt + IEM) contra los valores publicados en la Tabla 1 de Baghdadi (2011). Es la prueba de "éxito" del modelo calibrado (error < 0.5 dB).
-3.  **`limits_test.py`:** Un "sanity check" que asegura que el suelo seco (`mv` -> 0) produce una señal físicamente baja (ej. < -25 dB).
-4.  **`monotonicity_test.py`:** La prueba más crítica. Verifica que la señal $\sigma^0$ **aumenta monotónicamente** con la humedad `mv`. Los fallos en esta prueba (curvas planas o colapsadas) fueron el principal indicador de errores en la implementación de la Eq. (17) y (18).
+```bash
+python -m inversion.hybrid_physics_ml \
+  --train_csv data/training_dataset.csv \
+  --val_csv data/validation_dataset.csv \
+  --epochs 100 --batch_size 256
+# guarda inversion/models/best_physics_guided_model.pth
+```
 
-**Implicación:** Cualquier modificación futura a `models.py` debe volver a pasar este conjunto de pruebas para ser considerada válida.
+> Nota: `hybrid_physics_ml.py` calcula una pérdida de consistencia física llamando a `IEM_Model.compute_backscatter` con las predicciones. Se recomienda lotes moderados si no hay GPU.
 
-## 5. Contexto e Implicaciones de la Investigación
+### 4) Incertidumbre
 
-La recuperación de la humedad del suelo ($M_v$) a partir de datos SAR es un "problema mal planteado" (ill-posed) porque la señal $\sigma^0$ es una mezcla de $M_v$ y $H_{rms}$.
+```bash
+# modo completo: analítica + Monte Carlo + mapas de calidad + análisis angular
+python -m inversion.uncertainty_propagation --mode full --n_mc 10000
+# salidas: analysis/outputs/quality_map_predicted_theta35.png, uncertainty_vs_angle.png
+```
 
-Al implementar un modelo físico validado, podemos:
+### 5) Validación física y numérica (tests)
 
-1.  **Generar un Dataset Controlado:** Ejecutar `models.py` $10^5$ o $10^6$ veces para crear una tabla masiva de `[mv, hrms, theta, sigma0_vv]`.
-2.  **Entrenar un Inversor de ML:** Usar esta tabla para entrenar una red neuronal que aprenda la función de inversión no lineal: `f(sigma0_vv, theta, ...) -> mv`.
-3.  **Habilitar la Corrección de Rugosidad:** Dado que el modelo fue entrenado con datos que cubren todo el espectro de rugosidad (gracias a `Lopt` y `Hrms` en las ecuaciones), la red neuronal aprende implícitamente a corregir el efecto de la rugosidad.
+Ejecutar cada test desde la raíz:
 
-En resumen, la **precisión física de este código es la base del éxito de todo el proyecto de Machine Learning**. Si este modelo es correcto, el conjunto de datos sintético será una representación precisa de la física de la Banda C, permitiendo al modelo de ML operar con éxito en datos satelitales reales de Sentinel-1.
+```bash
+python -m tests.fung_test
+python -m tests.baghdadi_test
+python -m tests.limits_test
+python -m tests.monotonicity_test
+```
+
+Qué valida cada uno:
+
+* **fung_test.py**: aplica la serie de IEM “white-box” con dieléctrico fijo, compara VV con valores aproximados de Fung Fig.2 y HV como VV−12 dB; verifica monotonicidad con ángulo.
+* **baghdadi_test.py**: compara HV con valores tabulados de Baghdadi 2011 (Table 1). Tolerancia típica: |Δσ⁰|≤1 dB.
+* **limits_test.py**: barres ks∈{0.3,1.0,3.0}, fijo kL=6, reporta σ⁰_VV(θ) y tendencia física esperada; también σ⁰ vs mv en θ=35° para VV/HV.
+* **monotonicity_test.py**: verifica que σ⁰_HV crece con mv para distintos s y θ; reporta rango dinámico y descensos.
+
+---
+
+## Componentes clave
+
+### `core/models.py`
+
+* **DielectricModel (Hallikainen, 1985)**:
+  (\varepsilon_r(mv) = (\text{poly}(mv; f, textura))*\text{real} + j,(\text{poly}(mv; f, textura))*\text{imag})
+  Entrada: mv (% o fracción), textura (sand, clay), f (Hz).
+
+* **SurfaceRoughness**:
+  (L_\text{opt}) calibrado por polarización (Baghdadi 2011) y espectro (W^{(n)}) (Fung 4-A.3 gaussiano).
+  `compute_Lopt(rms_cm, θ, pol)` y `get_spectrum(2k_x, L, n)`.
+
+* **IEM_Model (Fung 1992 + Baghdadi 2011 + Hallikainen 1985)**:
+  [
+  \sigma^0=\frac{k^2}{2}e^{-2(k_z s)^2}\sum_{n=1}^{N}\frac{W^{(n)}(2k_x)}{n!},\left|, (2k_z s)^n f_{pp} + \frac{(k_z s)^{2n}}{2} F_{pp} ,\right|^2
+  ]
+  Con (f_{vv}, F_{vv}) y (f_{hv}=0, F_{hv}) (cross-pol multiescattering).
+  Retorna σ⁰ en dB.
+
+### `inversion/uncertainty_propagation.py`
+
+* **Analítico**: linealiza con Jacobiano numérico, invierte derivadas para propagar varianzas.
+* **Monte Carlo**: muestrea ruido en σ⁰, s y θ; invierte por optimización o LUT; reporta media, std, IC, RMSE, sesgo; tasa de éxito.
+* **Mapa de calidad (O2)**: predice incertidumbre esperada por pixel sin validación in situ usando sólo sensibilidad.
+
+### `inversion/neural_network.py`
+
+* RN feed-forward para inversión σ⁰→mv (y variantes con `rms` o clases).
+* Escenarios: sin prior, rms conocido, rango de mv como clase auxiliar.
+* Guarda modelos y compara RMSE/MAE/Bias entre escenarios.
+
+### `inversion/hybrid_physics_ml.py`
+
+* Physics-Guided NN: salida [mv, rms], fusión α·(física) + β·(ML).
+* Pérdida con término de consistencia física “forward”: (\sigma^0(\hat{mv},\hat{rms}) \approx \sigma^0_\text{obs}) usando `IEM_Model`.
+* Penalización de rangos válidos para mv y rms.
+
+---
+
+## Uso básico (receta mínima)
+
+1. Crear entorno y dependencias.
+2. `python -m data.generate_dataset` para CSV sintético.
+3. `python -m inversion.neural_network --dataset_path data/synthetic_dataset_100k.csv`.
+4. `python -m inversion.uncertainty_propagation --mode full`.
+5. `python -m tests.fung_test` y `python -m tests.baghdadi_test` para validaciones.
+6. Revisar figuras en `analysis/outputs/` y archivos `.png` generados por tests.
+
+---
+
+## Consideraciones de dominio
+
+* Banda C: `frequency=5.405e9` (Sentinel-1).
+* Validez IEM: controlar (k s < 3) y (kL) en rango moderado; fuera de dominio la serie puede desestabilizarse o producir sesgos.
+* Polarización: HV nace de multiescattering; típicamente σ⁰_HV es 8–15 dB menor que σ⁰_VV en suelo desnudo.
+* Textura: Hallikainen depende de arena/arcilla; mantener porcentajes físicos (0–100).
+
+---
+
+## Reproducibilidad
+
+* Fijar semilla en generadores (NumPy, PyTorch) según necesidad.
+* Registrar configuraciones de dataset y arquitectura en nombres de salida o en un JSON adjunto.
+* Versionar `requirements.txt` y documentar GPU/CPU.
+
+---
+
+## Troubleshooting
+
+**Síntoma:** `ImportError: cannot import name 'IEM_Model'`
+**Causa:** diferencias de layout de paquete.
+**Solución:** usar import con fallback (`from core.models import IEM_Model` y si falla `from models import IEM_Model`). Los tests ya incluyen esta lógica en los parches propuestos.
+
+**Síntoma:** `NaN` o `inf` en σ⁰ o pérdida física.
+**Causa:** violación de dominio, desbordes numéricos en serie o raíz compleja.
+**Solución:**
+
+* Verificar (k s) y (k L).
+* Clampear σ⁰ lineal mínima (`1e-20`) antes de pasar a dB.
+* Reducir `N_TERMS` o revisar `rms_cm` extremos.
+
+**Síntoma:** Curvas HV no monotónicas vs mv en pequeños tramos.
+**Causa:** ruido numérico de derivadas o sensibilidad angular.
+**Solución:** tolerancia de 0.05 dB por paso en `monotonicity_test.py`; revisar `θ` y paso de mv.
+
+**Síntoma:** RMSE > 1 dB en `baghdadi_test.py`.
+**Causa:** discrepancia en espectro y/o términos HV.
+**Solución:** asegurar espectro gaussiano en pruebas físicas, revisar implementación de (F_{hv}), verificar Lopt(HV) y θ.
+
+**Síntoma:** Entrenamiento híbrido lento.
+**Causa:** pérdida física llama a `compute_backscatter` por batch en CPU.
+**Solución:** reducir `batch_size`, cachear partes invariantes por batch, o vectorizar llamada.
+
+**Síntoma:** CUDA no disponible.
+**Solución:** usar CPU, bajar `batch_size`, revisar instalación de PyTorch acorde a CUDA local.
+
+---
+
+## Implementaciones faltantes / futuras
+
+1. **Guardas de dominio en `IEM_Model`**: avisos explícitos cuando (k s\ge 3) o (kL) fuera de rango; clamp y “quality flags”.
+2. **Selección de espectro por defecto**: usar Gaussiano por defecto para validación con Fung/Baghdadi; exponer parámetro público para alternar “gaussian”/“fractal”.
+3. **Términos (f_{vv}) y (F_{hv}) exactos**: reemplazar aproximaciones por formulaciones más fieles o LUT/ajustes con referencias. Parámetro `use_simplified_terms`.
+4. **Vectorización de la pérdida física** en `hybrid_physics_ml.py`: eliminar bucles Python internos y mover cómputo a tensores cuando sea viable.
+5. **Errores correlacionados en incertidumbre**: extender propagación analítica con covarianzas completas y Monte Carlo con correlación σ⁰–θ–s.
+6. **Convergencia de serie**: criterio adaptativo por ángulo y rugosidad, salida de diagnóstico N vs N−1.
+7. **Validación con Sentinel-1**: completar `validation/sentinel1_validation.py` con lectura de GRD/SLC, geocodificación, máscaras y comparación con in-situ si hay datos.
+8. **CLI unificado**: `python -m cli ...` para orquestar dataset, entrenamiento, incertidumbre y tests.
+9. **Documentación API**: docstrings completos y ejemplos mínimos por función clave.
+10. **Integración continua**: workflow de CI para ejecutar `tests/*.py` y generar artefactos.
+
+---
+
+## Licencia y citación
+
+* Citar fuentes primarias al reportar resultados: Hallikainen (1985), Fung (1992), Baghdadi (2011).
+* Indicar versión del repositorio y commit al usar figuras o métricas.
+
+---
+
+## Contacto
+
+Para contribuciones, abrir *issue* o *pull request* con:
+
+* Descripción clara del cambio
+* Impacto en reproducibilidad y validaciones
+* Comparación antes/después (curvas o métricas)
